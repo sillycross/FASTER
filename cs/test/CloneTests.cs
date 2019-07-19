@@ -1,13 +1,13 @@
 ﻿// Copyright (c) Microsoft Corporation. All rights reserved.
 // Licensed under the MIT license.
 
-using FASTER.core;
-using NUnit.Framework;
-using NUnit.Framework.Internal;
 using System;
 using System.Collections.Generic;
 using System.IO;
 using System.Linq;
+using FASTER.core;
+using NUnit.Framework;
+using NUnit.Framework.Internal;
 using static FASTER.test.CloneTests;
 
 namespace FASTER.test
@@ -16,7 +16,6 @@ namespace FASTER.test
     internal class CloneTests
     {
         public const int TotalRecordSlotsInMemory = 336;
-        public static int DirectoryFileCount(string path) => new DirectoryInfo(path).GetFiles().Length;
 
         public class CloneTestKey
         {
@@ -302,9 +301,7 @@ namespace FASTER.test
         [Test]
         public void CircularBufferOfClones()
         {
-            // Creates a circular buffer of 5 instance clones, at each iteration 
-            const int concurrentInstances = 5;
-            const int totalClones = 20;
+            const int concurrentInstances = 50;
             var originalSourceCount = TotalRecordSlotsInMemory;
             var deltaCount = TotalRecordSlotsInMemory;
             var instanceList = new LinkedList<Tuple<LookupStore, int /*start of record range*/, int /*end of record range*/>>();
@@ -314,12 +311,9 @@ namespace FASTER.test
             fullInstance.PopulateDefault(0, originalSourceCount);
             fullInstance.VerifyDefault(0, originalSourceCount);
             Assert.IsTrue(Directory.Exists(fullInstance.LogPath));
-            var logFileCount = DirectoryFileCount(fullInstance.LogPath);
-            Assert.IsTrue(logFileCount > 0);
 
             instanceList.AddFirst(new Tuple<LookupStore, int, int>(fullInstance, 0, originalSourceCount));
 
-            var netCloneCount = 0;
             void CreateNewClone()
             {
                 var tuple = instanceList.Last.Value;
@@ -327,7 +321,6 @@ namespace FASTER.test
                 var sourceFirst = tuple.Item2;
                 var sourceLast = tuple.Item3;
                 var nextClone = sourceInstance.Clone();
-                netCloneCount++;
 
                 var cloneFirst = sourceLast + deltaCount;
                 var cloneLast = sourceLast + deltaCount;
@@ -350,31 +343,13 @@ namespace FASTER.test
                 nextClone.Seal();
                 nextClone.VerifyDefault(cloneFirst, cloneLast - cloneFirst);
 
-                // Log files should be growing as we add more instances/records
-                var newLogFileCount = DirectoryFileCount(nextClone.LogPath);
-                Assert.IsTrue(newLogFileCount > logFileCount);
-                logFileCount = newLogFileCount;
-            }
-
-            void VerifyAllInstances()
-            {
-                // Verify all instances
-                foreach (var tuple in instanceList)
+                if (cloneFirst > deltaCount)
                 {
-                    var instance = tuple.Item1;
-                    var first = tuple.Item2;
-                    var last = tuple.Item3;
-                    instance.VerifyDefault(first, last - first);
-
-                    // Make sure deleted records not found
-                    if (first > deltaCount)
-                    {
-                        instance.VerifyNotFound(first - deltaCount, deltaCount);
-                    }
-
-                    // Make sure future records not found
-                    instance.VerifyNotFound(last, deltaCount);
+                    nextClone.VerifyNotFound(cloneFirst - deltaCount, deltaCount);
                 }
+
+                // Make sure future records not found
+                nextClone.VerifyNotFound(cloneLast, deltaCount);
             }
 
             // Establish the baseline concurrent stores
@@ -383,20 +358,25 @@ namespace FASTER.test
                 CreateNewClone();
             }
 
-            VerifyAllInstances();
-
-            // Start exiring the oldest stores as we add new stores
-            while (netCloneCount < totalClones)
+            // Verify all instances
+            foreach (var tuple in instanceList)
             {
-                CreateNewClone();
+                var instance = tuple.Item1;
+                var first = tuple.Item2;
+                var last = tuple.Item3;
+                instance.VerifyDefault(first, last - first);
 
-                var oldestInstance = instanceList.First.Value.Item1;
-                oldestInstance.Dispose();
-                instanceList.RemoveFirst();
+                // Make sure deleted records not found
+                if (first > deltaCount)
+                {
+                    instance.VerifyNotFound(first - deltaCount, deltaCount);
+                }
 
-                VerifyAllInstances();
+                // Make sure future records not found
+                instance.VerifyNotFound(last, deltaCount);
             }
 
+            // Dispose all instances
             while (instanceList.Count > 0)
             {
                 instanceList.First.Value.Item1.Dispose();
@@ -407,8 +387,8 @@ namespace FASTER.test
 
     internal class LookupStore : IDisposable
     {
-        const int ConcurrentRMWCount = 100;
-        private readonly int cloneNumber = 0;
+        private const int ConcurrentRMWCount = 100;
+        private readonly int cloneNumber;
         private readonly FasterKV<RecordWrapper, RecordList, RecordOperation, RecordList, Empty, CloneTestCallbacks> faster;
         private readonly LocalStorageDevice logDevice;
         private readonly LocalStorageDevice objectLogDevice;
