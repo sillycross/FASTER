@@ -27,6 +27,7 @@ namespace FASTER.core
         /// <param name="filename"></param>
         /// <param name="preallocateFile"></param>
         /// <param name="deleteOnClose"></param>
+        /// <param name="disableFileBuffering"></param>
         public LocalStorageDevice(string filename, bool preallocateFile = false, bool deleteOnClose = false, bool disableFileBuffering = true)
             : base(filename, GetSectorSize(filename))
         {

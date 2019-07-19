@@ -2,16 +2,12 @@
 // Licensed under the MIT license.
 
 using FASTER.core;
-using Microsoft.Win32.SafeHandles;
 using NUnit.Framework;
 using NUnit.Framework.Internal;
 using System;
-using System.Collections;
 using System.Collections.Generic;
-using System.Diagnostics;
 using System.IO;
 using System.Linq;
-using System.Threading;
 using static FASTER.test.CloneTests;
 
 namespace FASTER.test
@@ -138,78 +134,22 @@ namespace FASTER.test
             public static RecordOperation CreateAddOperation(CloneTestPayload payload) => new RecordOperation(payload, true);
             public static RecordOperation CreateDeleteOperation(CloneTestPayload payload) => new RecordOperation(payload, false);
         }
-
-        public class CloneTestDevice : LocalStorageDevice
+        public static void CopyAll(DirectoryInfo source, DirectoryInfo target)
         {
-            public int lastSegmentId = 0;
+            Directory.CreateDirectory(target.FullName);
 
-            // File Buffering - When we aren't performing data integrity checks, all writes/reads are sector aligned, so we can disable file buffering for performance.
-            // When performing data integrity checks, we need to write/read at non-sector aligned offsets, so we need file buffering enabled
-            public CloneTestDevice(string name) : base(name, preallocateFile: false, deleteOnClose: true, disableFileBuffering: false)
+            // Copy each file
+            foreach (var file in source.GetFiles())
             {
-                if (!Environment.Is64BitProcess)
-                {
-                    throw new InvalidOperationException("Only 64 bit is supported");
-                }
+                file.CopyTo(Path.Combine(target.FullName, file.Name), true);
             }
 
-            public CloneTestDevice(CloneTestDevice cloneSource, string newDeviceName) : this(newDeviceName)
+            // Copy each subdirectory using recursion.
+            foreach (var sourceSubDirectory in source.GetDirectories())
             {
-                // When cloning a device, we need to open handles to all shared log files
-                // so they persist if the source device is disposed.
-                this.lastSegmentId = cloneSource.lastSegmentId;
-                for (int segmentId = 0; segmentId <= this.lastSegmentId; segmentId++)
-                {
-                    var hardLinkName = GetSegmentName(segmentId);
-                    var sourceFileName = cloneSource.GetSegmentName(segmentId);
-                    File.Copy(sourceFileName, hardLinkName);
-                    try
-                    {
-                        GetOrAddHandle(segmentId);
-                    }
-                    catch
-                    {
-                        File.Delete(hardLinkName);
-                        throw;
-                    }
-                }
+                var nextTargetSubDir = target.CreateSubdirectory(sourceSubDirectory.Name);
+                CopyAll(sourceSubDirectory, nextTargetSubDir);
             }
-
-            public CloneTestDevice Clone(string newDeviceName) => new CloneTestDevice(this, newDeviceName);
-
-            public override void DeleteSegmentRange(int fromSegment, int toSegment) => throw new NotImplementedException();
-            
-            public override unsafe void WriteAsync(IntPtr sourceAddress, int segmentId, ulong destinationAddress, uint numBytesToWrite, IOCompletionCallback callback, IAsyncResult asyncResult)
-            {
-                InterlockedExchangeIfGreaterThan(ref this.lastSegmentId, segmentId);
-                base.WriteAsync(sourceAddress, segmentId, destinationAddress, numBytesToWrite, callback, asyncResult);
-            }
-            
-            public override unsafe void ReadAsync(int segmentId, ulong sourceAddress, IntPtr destinationAddress, uint readLength, IOCompletionCallback callback, IAsyncResult asyncResult)
-            {
-                Debug.Assert(readLength > 0, "validation");
-                // Uncomment this line to repro FataExecutionEngineError
-                // byte[] buffer = new byte[readLength];
-                base.ReadAsync(segmentId, sourceAddress, destinationAddress, readLength, callback, asyncResult);
-            }
-            
-            public static void InterlockedExchangeIfGreaterThan(ref int location, int comparand)
-            {
-                int originalLocationValue;
-                do
-                {
-                    originalLocationValue = location;
-                    if (originalLocationValue >= comparand)
-                    {
-                        return;
-                    }
-                } while (Interlocked.CompareExchange(ref location, comparand, originalLocationValue) != originalLocationValue);
-            }
-        }
-
-        public LookupStore CreateStore()
-        {
-            return new LookupStore();
         }
 
         public class CloneTestCallbacks : IFunctions<RecordWrapper, RecordList, RecordOperation, RecordList, Empty>
@@ -352,22 +292,11 @@ namespace FASTER.test
                 => throw new NotImplementedException(); // We don't use Delete
         }
 
-        private readonly Queue<IDisposable> disposables = new Queue<IDisposable>();
-
         [TearDown]
         public void TestCleanup()
         {
-            while (this.disposables.Count > 0)
-            {
-                var disposable = this.disposables.Dequeue();
-                try
-                {
-                    disposable.Dispose();
-                }
-                catch (ObjectDisposedException)
-                {
-                }
-            }
+            try { Directory.Delete(LookupStore.RootDirectory, recursive: true); }
+            catch { }
         }
 
         [Test]
@@ -381,9 +310,9 @@ namespace FASTER.test
             var instanceList = new LinkedList<Tuple<LookupStore, int /*start of record range*/, int /*end of record range*/>>();
 
             // Establish the base full snapshot instance
-            var fullInstance = CreateStore();
-            fullInstance.PopulateDefault(originalSourceCount);
-            fullInstance.VerifyDefault(originalSourceCount);
+            var fullInstance = new LookupStore();
+            fullInstance.PopulateDefault(0, originalSourceCount);
+            fullInstance.VerifyDefault(0, originalSourceCount);
             Assert.IsTrue(Directory.Exists(fullInstance.LogPath));
             var logFileCount = DirectoryFileCount(fullInstance.LogPath);
             Assert.IsTrue(logFileCount > 0);
@@ -398,7 +327,6 @@ namespace FASTER.test
                 var sourceFirst = tuple.Item2;
                 var sourceLast = tuple.Item3;
                 var nextClone = sourceInstance.Clone();
-                this.disposables.Enqueue(nextClone);
                 netCloneCount++;
 
                 var cloneFirst = sourceLast + deltaCount;
@@ -410,6 +338,8 @@ namespace FASTER.test
                 {
                     nextClone.Add(new CloneTestKey() { Value = i }, new CloneTestPayload() { Value = $"Payload.{i}" });
                 }
+
+                nextClone.CompletePending();
 
                 // Delete deltaCount records from beginning of source's range
                 for (long i = sourceFirst; i < cloneFirst; i++)
@@ -466,16 +396,19 @@ namespace FASTER.test
 
                 VerifyAllInstances();
             }
+
+            while (instanceList.Count > 0)
+            {
+                instanceList.First.Value.Item1.Dispose();
+                instanceList.RemoveFirst();
+            }
         }
     }
-
 
     internal class LookupStore : IDisposable
     {
         const int ConcurrentRMWCount = 100;
         private readonly int cloneNumber = 0;
-        private readonly CloneTestDevice logDevice;
-        private readonly CloneTestDevice objectLogDevice;
         private readonly FasterKV<RecordWrapper, RecordList, RecordOperation, RecordList, Empty, CloneTestCallbacks> faster;
         private int pendingRMWCount = 0;
         private Guid checkpoint;
@@ -488,19 +421,13 @@ namespace FASTER.test
         {
             this.cloneNumber = storeToClone?.cloneNumber + 1 ?? 0; // Must be set before referencing checkpoint path
 
-            if (storeToClone == null)
+            Directory.CreateDirectory(this.LogDevicePath);
+            Directory.CreateDirectory(this.ObjectLogDevicePath);
+            Directory.CreateDirectory(this.CheckpointPath);
+            if (storeToClone != null)
             {
-                Directory.CreateDirectory(RootDirectory);
-                Directory.CreateDirectory(this.CheckpointPath);
-                Directory.CreateDirectory(this.LogPath);
-                this.logDevice = new CloneTestDevice(this.LogDevicePath);
-                this.objectLogDevice = new CloneTestDevice(this.ObjectLogDevicePath);
-            }
-            else
-            {
-                Directory.CreateDirectory(this.LogPath);
-                this.logDevice = storeToClone.logDevice.Clone(this.LogDevicePath);
-                this.objectLogDevice = storeToClone.objectLogDevice.Clone(this.ObjectLogDevicePath);
+                // Copy log directories for new clone
+                CopyAll(new DirectoryInfo(storeToClone.LogPath), new DirectoryInfo(this.LogPath));
             }
 
             this.faster = new FasterKV<
@@ -514,8 +441,8 @@ namespace FASTER.test
                 new CloneTestCallbacks(),
                 new LogSettings
                 {
-                    LogDevice = logDevice,
-                    ObjectLogDevice = objectLogDevice,
+                    LogDevice = new LocalStorageDevice(this.LogDevicePath),
+                    ObjectLogDevice = new LocalStorageDevice(this.ObjectLogDevicePath),
                     CopyReadsToTail = false,
                     PageSizeBits = 9,
                     SegmentSizeBits = 13,
@@ -550,6 +477,8 @@ namespace FASTER.test
         internal string LogDevicePath => $"{this.LogPath}\\Log";
         internal string ObjectLogDevicePath => $"{this.LogPath}\\ObjectLog";
 
+        public void CompletePending() => this.faster.CompletePending(true);
+
         public void Seal()
         {
             // We can flush the entire main log to disk, since we use ReadCache for our cache
@@ -565,10 +494,10 @@ namespace FASTER.test
         public LookupStore Clone() => new LookupStore(this);
 
         public void Add(CloneTestKey key, CloneTestPayload payload)
-                => RMW(key, RecordOperation.CreateAddOperation(payload));
+            => RMW(key, RecordOperation.CreateAddOperation(payload));
 
         public void Delete(CloneTestKey key, CloneTestPayload payload)
-                => RMW(key, RecordOperation.CreateDeleteOperation(payload));
+            => RMW(key, RecordOperation.CreateDeleteOperation(payload));
 
         public IEnumerable<CloneTestPayload> Lookup(CloneTestKey key)
         {
@@ -576,7 +505,6 @@ namespace FASTER.test
             var outputValue = new RecordList();
             var fasterKey = new RecordWrapper() { Value = key };
             var status = this.faster.Read(ref fasterKey, ref input, ref outputValue, Empty.Default, 0);
-
             if (status == Status.ERROR)
             {
                 throw new InvalidOperationException($"FASTER Read failed with {Status.ERROR}");
@@ -590,12 +518,7 @@ namespace FASTER.test
                 this.faster.CompletePending(true);
             }
 
-            if (outputValue.List.Count == 0)
-            {
-                return null;
-            }
-
-            return outputValue.List;
+            return (outputValue.List.Count == 0) ? null : outputValue.List;
         }
 
         public void RMW(CloneTestKey key, RecordOperation operation)
@@ -627,8 +550,6 @@ namespace FASTER.test
             Seal();
         }
 
-        public void PopulateDefault(int count) => PopulateDefault(0, count);
-
         public void VerifyDefault(int startingIndex, int count)
         {
             for (long i = startingIndex; i < startingIndex + count; i++)
@@ -648,7 +569,6 @@ namespace FASTER.test
             }
         }
 
-        public void VerifyDefault(int count) => VerifyDefault(0, count);
         public void Dispose() => this.faster.Dispose();
     }
 }
