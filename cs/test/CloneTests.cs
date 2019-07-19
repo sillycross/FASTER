@@ -410,6 +410,8 @@ namespace FASTER.test
         const int ConcurrentRMWCount = 100;
         private readonly int cloneNumber = 0;
         private readonly FasterKV<RecordWrapper, RecordList, RecordOperation, RecordList, Empty, CloneTestCallbacks> faster;
+        private readonly LocalStorageDevice logDevice;
+        private readonly LocalStorageDevice objectLogDevice;
         private int pendingRMWCount = 0;
         private Guid checkpoint;
 
@@ -430,6 +432,9 @@ namespace FASTER.test
                 CopyAll(new DirectoryInfo(storeToClone.LogPath), new DirectoryInfo(this.LogPath));
             }
 
+            this.logDevice = new LocalStorageDevice(this.LogDevicePath);
+            this.objectLogDevice = new LocalStorageDevice(this.ObjectLogDevicePath);
+
             this.faster = new FasterKV<
                 RecordWrapper,      // Key
                 RecordList,         // Value - storage format of all payloads in FASTER. We instance a list of records for each key.
@@ -441,8 +446,8 @@ namespace FASTER.test
                 new CloneTestCallbacks(),
                 new LogSettings
                 {
-                    LogDevice = new LocalStorageDevice(this.LogDevicePath),
-                    ObjectLogDevice = new LocalStorageDevice(this.ObjectLogDevicePath),
+                    LogDevice = this.logDevice,
+                    ObjectLogDevice = this.objectLogDevice,
                     CopyReadsToTail = false,
                     PageSizeBits = 9,
                     SegmentSizeBits = 13,
@@ -493,11 +498,9 @@ namespace FASTER.test
 
         public LookupStore Clone() => new LookupStore(this);
 
-        public void Add(CloneTestKey key, CloneTestPayload payload)
-            => RMW(key, RecordOperation.CreateAddOperation(payload));
+        public void Add(CloneTestKey key, CloneTestPayload payload) => RMW(key, RecordOperation.CreateAddOperation(payload));
 
-        public void Delete(CloneTestKey key, CloneTestPayload payload)
-            => RMW(key, RecordOperation.CreateDeleteOperation(payload));
+        public void Delete(CloneTestKey key, CloneTestPayload payload) => RMW(key, RecordOperation.CreateDeleteOperation(payload));
 
         public IEnumerable<CloneTestPayload> Lookup(CloneTestKey key)
         {
@@ -569,6 +572,11 @@ namespace FASTER.test
             }
         }
 
-        public void Dispose() => this.faster.Dispose();
+        public void Dispose()
+        {
+            this.faster.Dispose();
+            this.logDevice.Close();
+            this.objectLogDevice.Close();
+        }
     }
 }
