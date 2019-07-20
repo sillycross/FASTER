@@ -19,7 +19,7 @@ namespace FASTER.core
         private readonly bool preallocateFile;
         private readonly bool deleteOnClose;
         private readonly bool disableFileBuffering;
-        private readonly ConcurrentDictionary<int, SafeFileHandle> logHandles;
+        private readonly SafeConcurrentDictionary<int, SafeFileHandle> logHandles;
 
         /// <summary>
         /// Constructor
@@ -35,7 +35,7 @@ namespace FASTER.core
             this.preallocateFile = preallocateFile;
             this.deleteOnClose = deleteOnClose;
             this.disableFileBuffering = disableFileBuffering;
-            logHandles = new ConcurrentDictionary<int, SafeFileHandle>();
+            logHandles = new SafeConcurrentDictionary<int, SafeFileHandle>();
         }
 
         /// <summary>

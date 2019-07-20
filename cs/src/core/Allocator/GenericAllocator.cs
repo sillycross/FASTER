@@ -312,6 +312,8 @@ namespace FASTER.core
                 }
                 fixed (RecordInfo* pin = &src[0].info)
                 {
+                    Debug.Assert(buffer.aligned_pointer + numBytesToWrite <= (byte*)buffer.handle.AddrOfPinnedObject() + buffer.buffer.Length);
+
                     Buffer.MemoryCopy((void*)((long)Unsafe.AsPointer(ref src[0]) + start), buffer.aligned_pointer + start, 
                         numBytesToWrite - start, numBytesToWrite - start);
                 }
@@ -320,6 +322,8 @@ namespace FASTER.core
             {
                 fixed (RecordInfo* pin = &src[0].info)
                 {
+                    Debug.Assert(buffer.aligned_pointer + numBytesToWrite <= (byte*)buffer.handle.AddrOfPinnedObject() + buffer.buffer.Length);
+
                     Buffer.MemoryCopy((void*)((long)Unsafe.AsPointer(ref src[0]) + aligned_start), buffer.aligned_pointer + aligned_start, 
                         numBytesToWrite - aligned_start, numBytesToWrite - aligned_start);
                 }
@@ -941,6 +945,8 @@ namespace FASTER.core
         {
             fixed (RecordInfo* pin = &destinationPage[0].info)
             {
+                Debug.Assert(required_bytes <= recordSize * destinationPage.Length);
+
                 Buffer.MemoryCopy(src, Unsafe.AsPointer(ref destinationPage[0]), required_bytes, required_bytes);
             }
         }

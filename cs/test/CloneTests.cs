@@ -13,7 +13,7 @@ using static FASTER.test.CloneTests;
 namespace FASTER.test
 {
     [TestFixture]
-    internal class CloneTests
+    public class CloneTests
     {
         public const int TotalRecordSlotsInMemory = 336;
         public static int DirectoryFileCount(string path) => new DirectoryInfo(path).GetFiles().Length;
@@ -95,10 +95,13 @@ namespace FASTER.test
                 {
                     using (var binaryWriter = new BinaryWriter(this.stream, encoding: System.Text.Encoding.UTF8, leaveOpen: true))
                     {
-                        binaryWriter.Write(wrappedPayload.List.Count);
-                        foreach (var payload in wrappedPayload.List)
+                        lock (wrappedPayload.List)
                         {
-                            binaryWriter.Write(payload.Value);
+                            binaryWriter.Write(wrappedPayload.List.Count);
+                            foreach (var payload in wrappedPayload.List)
+                            {
+                                binaryWriter.Write(payload.Value);
+                            }
                         }
                     }
                 }
@@ -235,9 +238,16 @@ namespace FASTER.test
             /// </summary>
             public void CopyUpdater(ref RecordWrapper key, ref RecordOperation input, ref RecordList oldValue, ref RecordList newValue)
             {
+                newValue = new RecordList();
+                newValue.List = new List<CloneTestPayload>();
+                lock (oldValue.List)
+                {
+                    foreach (var p in oldValue.List)
+                        newValue.List.Add(p);
+                }
                 // No need to preserve the old value, just update in place and return it as the new value
-                InPlaceUpdater(ref key, ref input, ref oldValue);
-                newValue = oldValue;
+                InPlaceUpdater(ref key, ref input, ref newValue);
+                //newValue = oldValue;
             }
 
             /// <summary>
@@ -299,12 +309,14 @@ namespace FASTER.test
             catch { }
         }
 
-        [Test]
+        // [Test]
         public void CircularBufferOfClones()
         {
+            SectorAlignedBufferPool.Disabled = true;
+
             // Creates a circular buffer of 5 instance clones, at each iteration 
             const int concurrentInstances = 5;
-            const int totalClones = 20;
+            const int totalClones = 50;
             var originalSourceCount = TotalRecordSlotsInMemory;
             var deltaCount = TotalRecordSlotsInMemory;
             var instanceList = new LinkedList<Tuple<LookupStore, int /*start of record range*/, int /*end of record range*/>>();
@@ -313,6 +325,7 @@ namespace FASTER.test
             var fullInstance = new LookupStore();
             fullInstance.PopulateDefault(0, originalSourceCount);
             fullInstance.VerifyDefault(0, originalSourceCount);
+
             Assert.IsTrue(Directory.Exists(fullInstance.LogPath));
             var logFileCount = DirectoryFileCount(fullInstance.LogPath);
             Assert.IsTrue(logFileCount > 0);
@@ -320,7 +333,7 @@ namespace FASTER.test
             instanceList.AddFirst(new Tuple<LookupStore, int, int>(fullInstance, 0, originalSourceCount));
 
             var netCloneCount = 0;
-            void CreateNewClone()
+            void CreateNewClone(int cnt = 0)
             {
                 var tuple = instanceList.Last.Value;
                 var sourceInstance = tuple.Item1;
@@ -331,7 +344,9 @@ namespace FASTER.test
 
                 var cloneFirst = sourceLast + deltaCount;
                 var cloneLast = sourceLast + deltaCount;
-                instanceList.AddLast(new Tuple<LookupStore, int, int>(nextClone, cloneFirst, cloneLast));
+
+                // if (cnt != 6)
+                    instanceList.AddLast(new Tuple<LookupStore, int, int>(nextClone, cloneFirst, cloneLast));
 
                 // Add deltaCount records to the end of source's range
                 for (long i = sourceLast; i < cloneLast; i++)
@@ -349,7 +364,7 @@ namespace FASTER.test
 
                 nextClone.Seal();
                 nextClone.VerifyDefault(cloneFirst, cloneLast - cloneFirst);
-
+                
                 // Log files should be growing as we add more instances/records
                 var newLogFileCount = DirectoryFileCount(nextClone.LogPath);
                 Assert.IsTrue(newLogFileCount > logFileCount);
@@ -380,14 +395,18 @@ namespace FASTER.test
             // Establish the baseline concurrent stores
             while (instanceList.Count < concurrentInstances)
             {
-                CreateNewClone();
+                Console.WriteLine(instanceList.Count);
+                CreateNewClone(instanceList.Count);
+                //VerifyAllInstances();
             }
-
+            //return;
             VerifyAllInstances();
 
             // Start exiring the oldest stores as we add new stores
             while (netCloneCount < totalClones)
             {
+                Console.WriteLine(netCloneCount);
+
                 CreateNewClone();
 
                 var oldestInstance = instanceList.First.Value.Item1;
@@ -412,6 +431,7 @@ namespace FASTER.test
         private readonly FasterKV<RecordWrapper, RecordList, RecordOperation, RecordList, Empty, CloneTestCallbacks> faster;
         private int pendingRMWCount = 0;
         private Guid checkpoint;
+        IDevice logDevice, objectLogDevice;
 
         public LookupStore() : this(null)
         {
@@ -430,6 +450,9 @@ namespace FASTER.test
                 CopyAll(new DirectoryInfo(storeToClone.LogPath), new DirectoryInfo(this.LogPath));
             }
 
+            logDevice = new LocalStorageDevice(this.LogDevicePath);
+            objectLogDevice = new LocalStorageDevice(this.ObjectLogDevicePath);
+
             this.faster = new FasterKV<
                 RecordWrapper,      // Key
                 RecordList,         // Value - storage format of all payloads in FASTER. We instance a list of records for each key.
@@ -441,8 +464,8 @@ namespace FASTER.test
                 new CloneTestCallbacks(),
                 new LogSettings
                 {
-                    LogDevice = new LocalStorageDevice(this.LogDevicePath),
-                    ObjectLogDevice = new LocalStorageDevice(this.ObjectLogDevicePath),
+                    LogDevice = logDevice,
+                    ObjectLogDevice = objectLogDevice,
                     CopyReadsToTail = false,
                     PageSizeBits = 9,
                     SegmentSizeBits = 13,
@@ -535,7 +558,7 @@ namespace FASTER.test
                 if (++this.pendingRMWCount >= ConcurrentRMWCount)
                 {
                     this.pendingRMWCount = 0;
-                    this.faster.CompletePending(false);
+                    this.faster.CompletePending(true);
                 }
             }
         }
@@ -569,6 +592,11 @@ namespace FASTER.test
             }
         }
 
-        public void Dispose() => this.faster.Dispose();
+        public void Dispose()
+        {
+            this.faster.Dispose();
+            this.logDevice.Close();
+            this.objectLogDevice.Close();
+        }
     }
 }
