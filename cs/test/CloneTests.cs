@@ -8,6 +8,7 @@ using System;
 using System.Collections.Generic;
 using System.IO;
 using System.Linq;
+using System.Threading;
 using static FASTER.test.CloneTests;
 
 namespace FASTER.test
@@ -312,13 +313,42 @@ namespace FASTER.test
         // [Test]
         public void CircularBufferOfClones()
         {
-            SectorAlignedBufferPool.Disabled = true;
-
             // Creates a circular buffer of 5 instance clones, at each iteration 
             const int concurrentInstances = 5;
             const int totalClones = 50;
             var originalSourceCount = TotalRecordSlotsInMemory;
             var deltaCount = TotalRecordSlotsInMemory;
+
+            void RehydrateClone(int cloneId)
+            {
+                var nextClone = new LookupStore(cloneId);
+                var sourceFirst = deltaCount * cloneId;
+                var sourceLast = deltaCount * cloneId;
+                var cloneFirst = sourceLast + deltaCount;
+                var cloneLast = sourceLast + deltaCount;
+
+                // instanceList.AddLast(new Tuple<LookupStore, int, int>(nextClone, cloneFirst, cloneLast));
+
+                // Add deltaCount records to the end of source's range
+                for (long i = sourceLast; i < cloneLast; i++)
+                {
+                    nextClone.Add(new CloneTestKey() { Value = i }, new CloneTestPayload() { Value = $"Payload.{i}" });
+                }
+
+                nextClone.CompletePending();
+
+                // Delete deltaCount records from beginning of source's range
+                for (long i = sourceFirst; i < cloneFirst; i++)
+                {
+                    nextClone.Delete(new CloneTestKey() { Value = i }, new CloneTestPayload() { Value = $"Payload.{i}" });
+                }
+                nextClone.Seal();
+                nextClone.Dispose();
+            }
+
+            //for (int i=1; i<50; i++)
+            //    RehydrateClone(i);
+
             var instanceList = new LinkedList<Tuple<LookupStore, int /*start of record range*/, int /*end of record range*/>>();
 
             // Establish the base full snapshot instance
@@ -346,7 +376,7 @@ namespace FASTER.test
                 var cloneLast = sourceLast + deltaCount;
 
                 // if (cnt != 6)
-                    instanceList.AddLast(new Tuple<LookupStore, int, int>(nextClone, cloneFirst, cloneLast));
+                instanceList.AddLast(new Tuple<LookupStore, int, int>(nextClone, cloneFirst, cloneLast));
 
                 // Add deltaCount records to the end of source's range
                 for (long i = sourceLast; i < cloneLast; i++)
@@ -364,7 +394,7 @@ namespace FASTER.test
 
                 nextClone.Seal();
                 nextClone.VerifyDefault(cloneFirst, cloneLast - cloneFirst);
-                
+
                 // Log files should be growing as we add more instances/records
                 var newLogFileCount = DirectoryFileCount(nextClone.LogPath);
                 Assert.IsTrue(newLogFileCount > logFileCount);
@@ -405,7 +435,7 @@ namespace FASTER.test
             // Start exiring the oldest stores as we add new stores
             while (netCloneCount < totalClones)
             {
-                Console.WriteLine(netCloneCount);
+                Console.WriteLine(instanceList.Count);
 
                 CreateNewClone();
 
@@ -494,6 +524,65 @@ namespace FASTER.test
             this.faster.StartSession();
         }
 
+        public LookupStore(int cloneNumber)
+        {
+            Guid ckpt;
+            using (StreamReader sw = new StreamReader($"{RootDirectory}\\{cloneNumber-1}"))
+            {
+                ckpt = Guid.Parse(sw.ReadLine());
+            }
+
+            this.cloneNumber = cloneNumber;
+
+            Directory.CreateDirectory(this.LogDevicePath);
+            Directory.CreateDirectory(this.ObjectLogDevicePath);
+            Directory.CreateDirectory(this.CheckpointPath);
+
+            string OldLogPath = $"{RootDirectory}\\Logs_{this.cloneNumber-1}";
+
+            // Copy log directories for new clone
+            CopyAll(new DirectoryInfo(OldLogPath), new DirectoryInfo(this.LogPath));
+
+            logDevice = new LocalStorageDevice(this.LogDevicePath);
+            objectLogDevice = new LocalStorageDevice(this.ObjectLogDevicePath);
+
+            this.faster = new FasterKV<
+                RecordWrapper,      // Key
+                RecordList,         // Value - storage format of all payloads in FASTER. We instance a list of records for each key.
+                RecordOperation,    // Input - input format of payloads to FASTER. We input Add or Delete record operations.
+                RecordList,         // Output - output format of payloads returned by FASTER reads. We read a list of records for each key.
+                Empty,              // Context - arbitrary context passed to callback functions
+                CloneTestCallbacks>(
+                1 << 10,
+                new CloneTestCallbacks(),
+                new LogSettings
+                {
+                    LogDevice = logDevice,
+                    ObjectLogDevice = objectLogDevice,
+                    CopyReadsToTail = false,
+                    PageSizeBits = 9,
+                    SegmentSizeBits = 13,
+                    MemorySizeBits = 13,
+                    MutableFraction = 0.9,
+                    ReadCacheSettings = new ReadCacheSettings
+                    {
+                        PageSizeBits = 9,
+                        MemorySizeBits = 13,
+                        SecondChanceFraction = 0.9
+                    }
+                },
+                new CheckpointSettings { CheckpointDir = CheckpointPath, CheckPointType = CheckpointType.FoldOver },
+                new SerializerSettings<RecordWrapper, RecordList>
+                {
+                    keySerializer = () => RecordWrapper.CreateSerializer(),
+                    valueSerializer = () => RecordList.CreateSerializer(),
+                });
+
+            this.faster.Recover(ckpt);
+
+            this.faster.StartSession();
+        }
+
         internal static string RootDirectory { get; } = $"{Path.GetTempPath()}\\FASTER";
         internal string CheckpointPath => $"{RootDirectory}\\Checkpoints";
         internal string LogPath => $"{RootDirectory}\\Logs_{this.cloneNumber}";
@@ -512,6 +601,11 @@ namespace FASTER.test
             // on disk until we need to clone, since they will no longer change.
             this.faster.TakeFullCheckpoint(out this.checkpoint);
             this.faster.CompleteCheckpoint(wait: true);
+
+            using (StreamWriter sw = new StreamWriter($"{RootDirectory}\\{this.cloneNumber}"))
+            {
+                sw.WriteLine(this.checkpoint);
+            }
         }
 
         public LookupStore Clone() => new LookupStore(this);
