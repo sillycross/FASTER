@@ -175,7 +175,7 @@ class PendingReadContext : public AsyncPendingReadContext<typename RC::key_t> {
     if constexpr(kIsShallowKey) {
       read_context().key().write_deep_key_at(dst);
     } else {
-      memcpy(dst, &read_context().key(), key_size());
+      new (dst) key_t(read_context().key());
     }
   }
   inline KeyHash get_key_hash() const final {
@@ -257,7 +257,7 @@ class PendingUpsertContext : public AsyncPendingUpsertContext<typename UC::key_t
     if constexpr(kIsShallowKey) {
       upsert_context().key().write_deep_key_at(dst);
     } else {
-     memcpy(dst, &upsert_context().key(), key_size());
+      new (dst) key_t(upsert_context().key());
     }
   }
   inline KeyHash get_key_hash() const final {
@@ -348,7 +348,7 @@ class PendingRmwContext : public AsyncPendingRmwContext<typename MC::key_t> {
     if constexpr(kIsShallowKey) {
       rmw_context().key().write_deep_key_at(dst);
     } else {
-      memcpy(dst, &rmw_context().key(), key_size());
+      new (dst) key_t(rmw_context().key());
     }
   }
   inline KeyHash get_key_hash() const final {
@@ -446,7 +446,7 @@ class PendingDeleteContext : public AsyncPendingDeleteContext<typename MC::key_t
     if constexpr(kIsShallowKey) {
       delete_context().key().write_deep_key_at(dst);
     } else {
-      memcpy(dst, &delete_context().key(), key_size());
+      new (dst) key_t(delete_context().key());
     }
   }
   inline KeyHash get_key_hash() const final {
