@@ -199,7 +199,8 @@ class FasterKv {
   // create a new entry. The caller can use the "expected_entry" to CAS its desired address into
   // the entry.
   inline AtomicHashBucketEntry* FindOrCreateEntry(KeyHash hash, HashBucketEntry& expected_entry);
-  inline Address TraceBackForKeyMatch(const pending_context_t& ctxt, Address from_address,
+  template<class C>
+  inline Address TraceBackForKeyMatchCtxt(const C& ctxt, Address from_address,
                                       Address min_offset) const;
   inline Address TraceBackForKeyMatch(const key_t& key, Address from_address,
                                       Address min_offset) const;
@@ -787,7 +788,7 @@ inline OperationStatus FasterKv<K, V, D>::InternalRead(C& pending_context) const
     const record_t* record = reinterpret_cast<const record_t*>(hlog.Get(address));
     latest_record_version = record->header.checkpoint_version;
     if(!pending_context.is_key_equal(record->key())) {
-      address = TraceBackForKeyMatch(pending_context, record->header.previous_address(), head_address);
+      address = TraceBackForKeyMatchCtxt(pending_context, record->header.previous_address(), head_address);
     }
   }
 
@@ -856,7 +857,7 @@ inline OperationStatus FasterKv<K, V, D>::InternalUpsert(C& pending_context) {
     record_t* record = reinterpret_cast<record_t*>(hlog.Get(address));
     latest_record_version = record->header.checkpoint_version;
     if(!pending_context.is_key_equal(record->key())) {
-      address = TraceBackForKeyMatch(pending_context, record->header.previous_address(), head_address);
+      address = TraceBackForKeyMatchCtxt(pending_context, record->header.previous_address(), head_address);
     }
   }
 
@@ -999,7 +1000,7 @@ inline OperationStatus FasterKv<K, V, D>::InternalRmw(C& pending_context, bool r
     record_t* record = reinterpret_cast<record_t*>(hlog.Get(address));
     latest_record_version = record->header.checkpoint_version;
     if(!pending_context.is_key_equal(record->key())) {
-      address = TraceBackForKeyMatch(pending_context, record->header.previous_address(), head_address);
+      address = TraceBackForKeyMatchCtxt(pending_context, record->header.previous_address(), head_address);
     }
   }
 
@@ -1219,7 +1220,7 @@ inline OperationStatus FasterKv<K, V, D>::InternalDelete(C& pending_context) {
     const record_t* record = reinterpret_cast<const record_t*>(hlog.Get(address));
     latest_record_version = record->header.checkpoint_version;
     if(!pending_context.is_key_equal(record->key())) {
-      address = TraceBackForKeyMatch(pending_context, record->header.previous_address(), head_address);
+      address = TraceBackForKeyMatchCtxt(pending_context, record->header.previous_address(), head_address);
     }
   }
 
@@ -1315,7 +1316,8 @@ create_record:
 }
 
 template <class K, class V, class D>
-inline Address FasterKv<K, V, D>::TraceBackForKeyMatch(const pending_context_t& ctxt, Address from_address,
+template<class C>
+inline Address FasterKv<K, V, D>::TraceBackForKeyMatchCtxt(const C& ctxt, Address from_address,
     Address min_offset) const {
   while(from_address >= min_offset) {
     const record_t* record = reinterpret_cast<const record_t*>(hlog.Get(from_address));
@@ -1592,7 +1594,7 @@ OperationStatus FasterKv<K, V, D>::InternalContinuePendingRmw(ExecutionContext& 
   if(address >= head_address) {
     record_t* record = reinterpret_cast<record_t*>(hlog.Get(address));
     if(!pending_context->is_key_equal(record->key())) {
-      address = TraceBackForKeyMatch(*pending_context, record->header.previous_address(), head_address);
+      address = TraceBackForKeyMatchCtxt(*pending_context, record->header.previous_address(), head_address);
     }
   }
 
