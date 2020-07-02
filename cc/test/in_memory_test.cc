@@ -1937,7 +1937,7 @@ TEST(InMemFaster, UpsertRead_VariableLengthKey) {
         return !(*this == other);
       }
 
-      uint64_t key_length_;
+      uint32_t key_length_;
 
       inline const uint8_t* buffer() const {
         return reinterpret_cast<const uint8_t*>(this + 1);
@@ -1971,7 +1971,7 @@ TEST(InMemFaster, UpsertRead_VariableLengthKey) {
         return !(*this == other);
       }
 
-      uint64_t key_length_;
+      uint32_t key_length_;
       uint8_t* key_data_;
   };
 

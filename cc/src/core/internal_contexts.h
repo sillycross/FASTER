@@ -113,6 +113,32 @@ class PendingContext : public IAsyncContext {
   HashBucketEntry entry;
 };
 
+// A helper class to copy the key into FASTER log.
+// In old API, the Key provided is just the Key type, and we use in-place-new and copy constructor
+// to copy the key into the log. In new API, the user provides a ShallowKey, and we call the
+// ShallowKey's write_deep_key_at() method to write the key content into the log.
+// New API case (user provides ShallowKey)
+//
+template<bool isShallowKey>
+struct write_deep_key_at_helper
+{
+  template<class ShallowKey, class Key>
+  static inline void execute(const ShallowKey& key, Key* dst) {
+    key.write_deep_key_at(dst);
+  }
+};
+
+// Old API case (user provides Key)
+//
+template<>
+struct write_deep_key_at_helper<false>
+{
+  template<class Key>
+  static inline void execute(const Key& key, Key* dst) {
+    new (dst) Key(key);
+  }
+};
+
 /// FASTER's internal Read() context.
 
 /// An internal Read() context that has gone async and lost its type information.
@@ -172,11 +198,7 @@ class PendingReadContext : public AsyncPendingReadContext<typename RC::key_t> {
     return read_context().key().size();
   }
   inline void write_deep_key_at(key_t* dst) const final {
-    if constexpr(kIsShallowKey) {
-      read_context().key().write_deep_key_at(dst);
-    } else {
-      new (dst) key_t(read_context().key());
-    }
+    write_deep_key_at_helper<kIsShallowKey>::execute(read_context().key(), dst);
   }
   inline KeyHash get_key_hash() const final {
     return read_context().key().GetHash();
@@ -245,6 +267,7 @@ class PendingUpsertContext : public AsyncPendingUpsertContext<typename UC::key_t
   inline upsert_context_t& upsert_context() {
     return *static_cast<upsert_context_t*>(PendingContext<key_t>::caller_context);
   }
+
  public:
   /// Accessors.
   inline const key_or_shallow_key_t& get_key_or_shallow_key() const {
@@ -254,11 +277,7 @@ class PendingUpsertContext : public AsyncPendingUpsertContext<typename UC::key_t
     return upsert_context().key().size();
   }
   inline void write_deep_key_at(key_t* dst) const final {
-    if constexpr(kIsShallowKey) {
-      upsert_context().key().write_deep_key_at(dst);
-    } else {
-      new (dst) key_t(upsert_context().key());
-    }
+    write_deep_key_at_helper<kIsShallowKey>::execute(upsert_context().key(), dst);
   }
   inline KeyHash get_key_hash() const final {
     return upsert_context().key().GetHash();
@@ -345,11 +364,7 @@ class PendingRmwContext : public AsyncPendingRmwContext<typename MC::key_t> {
     return rmw_context().key().size();
   }
   inline void write_deep_key_at(key_t* dst) const final {
-    if constexpr(kIsShallowKey) {
-      rmw_context().key().write_deep_key_at(dst);
-    } else {
-      new (dst) key_t(rmw_context().key());
-    }
+    write_deep_key_at_helper<kIsShallowKey>::execute(rmw_context().key(), dst);
   }
   inline KeyHash get_key_hash() const final {
     return rmw_context().key().GetHash();
@@ -443,11 +458,7 @@ class PendingDeleteContext : public AsyncPendingDeleteContext<typename MC::key_t
     return delete_context().key().size();
   }
   inline void write_deep_key_at(key_t* dst) const final {
-    if constexpr(kIsShallowKey) {
-      delete_context().key().write_deep_key_at(dst);
-    } else {
-      new (dst) key_t(delete_context().key());
-    }
+    write_deep_key_at_helper<kIsShallowKey>::execute(delete_context().key(), dst);
   }
   inline KeyHash get_key_hash() const final {
     return delete_context().key().GetHash();
