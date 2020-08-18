@@ -35,11 +35,16 @@ enum class OperationType : uint8_t {
 enum class OperationStatus : uint8_t {
   SUCCESS,
   NOT_FOUND,
+  // for hotcold log, if the tombstone exists in the hot log, this is a not-found,
+  // even if the entry exists in cold log, and we should not inspect the cold log in that case.
+  //
+  NOT_FOUND_HOTLOG_TOMBSTONE,
   RETRY_NOW,
   RETRY_LATER,
   RECORD_ON_DISK,
   SUCCESS_UNMARK,
   NOT_FOUND_UNMARK,
+  NOT_FOUND_UNMARK_HOTLOG_TOMBSTONE,
   CPR_SHIFT_DETECTED
 };
 
@@ -59,7 +64,8 @@ class PendingContext : public IAsyncContext {
     , phase{ Phase::INVALID }
     , result{ Status::Pending }
     , address{ Address::kInvalidAddress }
-    , entry{ HashBucketEntry::kInvalidEntry } {
+    , entry{ HashBucketEntry::kInvalidEntry }
+    , is_hotlog_phase(false) {
   }
 
  public:
@@ -72,7 +78,8 @@ class PendingContext : public IAsyncContext {
     , phase{ other.phase }
     , result{ other.result }
     , address{ other.address }
-    , entry{ other.entry } {
+    , entry{ other.entry }
+    , is_hotlog_phase { other.is_hotlog_phase } {
   }
 
  public:
@@ -88,6 +95,10 @@ class PendingContext : public IAsyncContext {
   void continue_async(Address address_, HashBucketEntry entry_) {
     address = address_;
     entry = entry_;
+  }
+
+  void set_is_hotlog_phase(bool value) {
+    is_hotlog_phase = value;
   }
 
   virtual uint32_t key_size() const = 0;
@@ -111,6 +122,8 @@ class PendingContext : public IAsyncContext {
   Address address;
   /// Hash table entry that (indirectly) leads to the record being read or modified.
   HashBucketEntry entry;
+  /// whether we are in the hot log phase for hot-cold separated FasterKV
+  bool is_hotlog_phase;
 };
 
 // A helper class to copy the key into FASTER log.
@@ -157,6 +170,8 @@ class AsyncPendingReadContext : public PendingContext<K> {
  public:
   virtual void Get(const void* rec) = 0;
   virtual void GetAtomic(const void* rec) = 0;
+  virtual void GetV(const void* v) = 0;
+  virtual void GetAtomicV(const void* v) = 0;
 };
 
 /// A synchronous Read() context preserves its type information.
@@ -214,6 +229,70 @@ class PendingReadContext : public AsyncPendingReadContext<typename RC::key_t> {
     const record_t* record = reinterpret_cast<const record_t*>(rec);
     read_context().GetAtomic(record->value());
   }
+  inline void GetV(const void* v) final {
+    read_context().Get(*reinterpret_cast<const value_t*>(v));
+  }
+  inline void GetAtomicV(const void* v) final {
+    read_context().GetAtomic(*reinterpret_cast<const value_t*>(v));
+  }
+};
+
+/// Helper class for WrappedAsyncPendingReadContext
+template <class K>
+class WrappedAsyncPendingReadContextShallowKey {
+public:
+  WrappedAsyncPendingReadContextShallowKey(AsyncPendingReadContext<K>* ctxt)
+    : ctxt_(ctxt) {
+  }
+  inline uint32_t size() const {
+    return ctxt_->key_size();
+  }
+  inline KeyHash GetHash() const {
+    return ctxt_->get_key_hash();
+  }
+  inline void write_deep_key_at(K* dst) const {
+    ctxt_->write_deep_key_at(dst);
+  }
+  /// Comparison operators.
+  inline bool operator==(const K& other) const {
+    return ctxt_->is_key_equal(other);
+  }
+  inline bool operator!=(const K& other) const {
+    return !(*this == other);
+  }
+  AsyncPendingReadContext<K>* ctxt_;
+};
+
+/// A wrapper of AsyncPendingReadContext, that allows it to be passed to Read again
+template <class K, class V>
+class WrappedAsyncPendingReadContext : public IAsyncContext {
+ public:
+  typedef K key_t;
+  typedef V value_t;
+  using shallow_key_t = WrappedAsyncPendingReadContextShallowKey<K>;
+
+  WrappedAsyncPendingReadContext(AsyncPendingReadContext<K>* ctxt)
+    : ctxt_(ctxt)
+    , shallow_key_(ctxt) {
+  }
+  /// The deep copy constructor.
+  WrappedAsyncPendingReadContext(WrappedAsyncPendingReadContext& other)
+    : ctxt_(other.ctxt_), shallow_key_(other.shallow_key_) {
+  }
+protected:
+    /// The explicit interface requires a DeepCopy_Internal() implementation.
+    Status DeepCopy_Internal(IAsyncContext*& context_copy) {
+      return IAsyncContext::DeepCopy_Internal(*this, context_copy);
+    }
+ public:
+  const shallow_key_t& key() const { return shallow_key_; }
+  void Get(const value_t& value) { return ctxt_->GetV(&value); }
+  void GetAtomic(const value_t& value) { return ctxt_->GetAtomicV(&value); }
+
+ private:
+  // TODO: figure out when this should be freed
+  AsyncPendingReadContext<K>* ctxt_;
+  shallow_key_t shallow_key_;
 };
 
 /// FASTER's internal Upsert() context.

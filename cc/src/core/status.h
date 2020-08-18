@@ -15,6 +15,7 @@ enum class Status : uint8_t {
   IOError = 4,
   Corruption = 5,
   Aborted = 6,
+  NotFoundHotLogTombstone = 7
 };
 
 enum class InternalStatus : uint8_t {
