@@ -95,6 +95,7 @@ class IAsyncContext {
 
 /// User-defined callbacks for async FASTER operations. Async callback equivalent of:
 ///   Status some_function(context* arg).
+// using AsyncCallback = std::function<void(IAsyncContext* ctxt, Status result)>;
 typedef void(*AsyncCallback)(IAsyncContext* ctxt, Status result);
 
 /// Helper class, for use inside a continuation callback, that ensures the context will be freed

@@ -75,10 +75,11 @@ class alignas(Constants::kCacheLineBytes) ThreadContext {
 static_assert(sizeof(ThreadContext) == 448, "sizeof(ThreadContext) != 448");
 
 /// The FASTER key-value store.
-template <class K, class V, class D>
+template <class K, class V, class D, bool isHotColdLog = false>
 class FasterKv {
  public:
-  typedef FasterKv<K, V, D> faster_t;
+  typedef FasterKv<K, V, D, isHotColdLog> faster_t;
+  typedef FasterKv<K, V, D, false> cold_faster_t;   // not used if isHotColdLog == false
 
   /// Keys and values stored in this key-value store.
   typedef K key_t;
@@ -114,6 +115,10 @@ class FasterKv {
     resize_info_.version = 0;
     state_[0].Initialize(table_size, disk.log().alignment());
     overflow_buckets_allocator_[0].Initialize(disk.log().alignment(), epoch_);
+
+    if (isHotColdLog) {
+      cold_faster_ = new cold_faster_t(table_size, log_size, filename + "_cold", log_mutable_fraction, pre_allocate_log);
+    }
   }
 
   // No copy constructor.
@@ -154,6 +159,9 @@ class FasterKv {
   /// Log compaction entry method.
   bool Compact(uint64_t untilAddress);
 
+  void BatchInsertIntoColdLog(const std::vector<Record<K,V>*>& list);
+  void CompactHotLog(GcState::complete_callback_t complete_callback);
+
   /// Truncating the head of the log.
   bool ShiftBeginAddress(Address address, GcState::truncate_callback_t truncate_callback,
                          GcState::complete_callback_t complete_callback);
@@ -169,6 +177,8 @@ class FasterKv {
     state_[resize_info_.version].DumpDistribution(
       overflow_buckets_allocator_[resize_info_.version]);
   }
+
+  void StartSessionColdLog(Guid guid);
 
  private:
   typedef Record<key_t, value_t> record_t;
@@ -193,6 +203,16 @@ class FasterKv {
       AsyncIOContext& io_context);
   OperationStatus InternalContinuePendingRmw(ExecutionContext& ctx,
       AsyncIOContext& io_context);
+  bool RmwIssueColdLogQuery(
+      ExecutionContext& context,
+      async_pending_rmw_context_t* pending_context);
+  OperationStatus InternalContinuePendingRmwInternal(
+      ExecutionContext& context,
+      async_pending_rmw_context_t* pending_context,
+      bool fromIoContext,
+      Address ioContextAddress,
+      const record_t* disk_record,
+      const value_t* disk_value);
 
   // Find the hash bucket entry, if any, corresponding to the specified hash.
   // The caller can use the "expected_entry" to CAS its desired address into the entry.
@@ -270,7 +290,7 @@ class FasterKv {
                     HashBucketEntry entry);
 
   Address LogScanForValidity(Address from, faster_t* temp);
-  bool ContainsKeyInMemory(key_t key, Address offset);
+  bool ContainsKeyInMemory(const key_t& key, Address offset);
 
   /// Access the current and previous (thread-local) execution contexts.
   const ExecutionContext& thread_ctx() const {
@@ -289,6 +309,12 @@ class FasterKv {
  public:
   disk_t disk;
   hlog_t hlog;
+
+  // for debug and test
+  cold_faster_t* GetColdLog() {
+    assert(isHotColdLog);
+    return cold_faster_;
+  }
 
  private:
   static constexpr bool kCopyReadsToTail = false;
@@ -322,24 +348,41 @@ class FasterKv {
   /// Global count of pending I/Os, used for throttling.
   std::atomic<uint64_t> num_pending_ios;
 
+  /// the cold faster instance when hot-cold log is enabled
+  cold_faster_t* cold_faster_;
+
   /// Space for two contexts per thread, stored inline.
   ThreadContext thread_contexts_[Thread::kMaxNumThreads];
 };
 
 // Implementations.
-template <class K, class V, class D>
-inline Guid FasterKv<K, V, D>::StartSession() {
+template <class K, class V, class D, bool isHotColdLog>
+inline Guid FasterKv<K, V, D, isHotColdLog>::StartSession() {
   SystemState state = system_state_.load();
   if(state.phase != Phase::REST) {
     throw std::runtime_error{ "Can acquire only in REST phase!" };
   }
   thread_ctx().Initialize(state.phase, state.version, Guid::Create(), 0);
+  if (isHotColdLog) {
+    cold_faster_->StartSessionColdLog(thread_ctx().guid);
+  }
   Refresh();
   return thread_ctx().guid;
 }
 
-template <class K, class V, class D>
-inline uint64_t FasterKv<K, V, D>::ContinueSession(const Guid& session_id) {
+template <class K, class V, class D, bool isHotColdLog>
+inline void FasterKv<K, V, D, isHotColdLog>::StartSessionColdLog(Guid guid) {
+  assert(!isHotColdLog);
+  SystemState state = system_state_.load();
+  if(state.phase != Phase::REST) {
+    throw std::runtime_error{ "Can acquire only in REST phase!" };
+  }
+  thread_ctx().Initialize(state.phase, state.version, guid, 0);
+  Refresh();
+}
+
+template <class K, class V, class D, bool isHotColdLog>
+inline uint64_t FasterKv<K, V, D, isHotColdLog>::ContinueSession(const Guid& session_id) {
   auto iter = checkpoint_.continue_tokens.find(session_id);
   if(iter == checkpoint_.continue_tokens.end()) {
     throw std::invalid_argument{ "Unknown session ID" };
@@ -350,12 +393,15 @@ inline uint64_t FasterKv<K, V, D>::ContinueSession(const Guid& session_id) {
     throw std::runtime_error{ "Can continue only in REST phase!" };
   }
   thread_ctx().Initialize(state.phase, state.version, session_id, iter->second);
+  if (isHotColdLog) {
+    cold_faster_->ContinueSession(session_id);
+  }
   Refresh();
   return iter->second;
 }
 
-template <class K, class V, class D>
-inline void FasterKv<K, V, D>::Refresh() {
+template <class K, class V, class D, bool isHotColdLog>
+inline void FasterKv<K, V, D, isHotColdLog>::Refresh() {
   epoch_.ProtectAndDrain();
   // We check if we are in normal mode
   SystemState new_state = system_state_.load();
@@ -363,10 +409,13 @@ inline void FasterKv<K, V, D>::Refresh() {
     return;
   }
   HandleSpecialPhases();
+  if (isHotColdLog) {
+    cold_faster_->Refresh();
+  }
 }
 
-template <class K, class V, class D>
-inline void FasterKv<K, V, D>::StopSession() {
+template <class K, class V, class D, bool isHotColdLog>
+inline void FasterKv<K, V, D, isHotColdLog>::StopSession() {
   // If this thread is still involved in some activity, wait until it finishes.
   while(thread_ctx().phase != Phase::REST ||
         !thread_ctx().pending_ios.empty() ||
@@ -385,11 +434,14 @@ inline void FasterKv<K, V, D>::StopSession() {
 
   assert(thread_ctx().phase == Phase::REST);
 
+  if (isHotColdLog) {
+    cold_faster_->StopSession();
+  }
   epoch_.Unprotect();
 }
 
-template <class K, class V, class D>
-inline const AtomicHashBucketEntry* FasterKv<K, V, D>::FindEntry(KeyHash hash,
+template <class K, class V, class D, bool isHotColdLog>
+inline const AtomicHashBucketEntry* FasterKv<K, V, D, isHotColdLog>::FindEntry(KeyHash hash,
     HashBucketEntry& expected_entry) const {
   expected_entry = HashBucketEntry::kInvalidEntry;
   // Truncate the hash to get a bucket page_index < state[version].size.
@@ -429,8 +481,8 @@ inline const AtomicHashBucketEntry* FasterKv<K, V, D>::FindEntry(KeyHash hash,
   return nullptr; // NOT REACHED
 }
 
-template <class K, class V, class D>
-inline AtomicHashBucketEntry* FasterKv<K, V, D>::FindTentativeEntry(KeyHash hash,
+template <class K, class V, class D, bool isHotColdLog>
+inline AtomicHashBucketEntry* FasterKv<K, V, D, isHotColdLog>::FindTentativeEntry(KeyHash hash,
     HashBucket* bucket,
     uint8_t version, HashBucketEntry& expected_entry) {
   expected_entry = HashBucketEntry::kInvalidEntry;
@@ -490,8 +542,8 @@ inline AtomicHashBucketEntry* FasterKv<K, V, D>::FindTentativeEntry(KeyHash hash
   return nullptr; // NOT REACHED
 }
 
-template <class K, class V, class D>
-bool FasterKv<K, V, D>::HasConflictingEntry(KeyHash hash, const HashBucket* bucket, uint8_t version,
+template <class K, class V, class D, bool isHotColdLog>
+bool FasterKv<K, V, D, isHotColdLog>::HasConflictingEntry(KeyHash hash, const HashBucket* bucket, uint8_t version,
     const AtomicHashBucketEntry* atomic_entry) const {
   uint16_t tag = atomic_entry->load().tag();
   while(true) {
@@ -516,8 +568,8 @@ bool FasterKv<K, V, D>::HasConflictingEntry(KeyHash hash, const HashBucket* buck
   }
 }
 
-template <class K, class V, class D>
-inline AtomicHashBucketEntry* FasterKv<K, V, D>::FindOrCreateEntry(KeyHash hash,
+template <class K, class V, class D, bool isHotColdLog>
+inline AtomicHashBucketEntry* FasterKv<K, V, D, isHotColdLog>::FindOrCreateEntry(KeyHash hash,
     HashBucketEntry& expected_entry) {
   // Truncate the hash to get a bucket page_index < state[version].size.
   const uint32_t version = resize_info_.version;
@@ -556,9 +608,9 @@ inline AtomicHashBucketEntry* FasterKv<K, V, D>::FindOrCreateEntry(KeyHash hash,
   return nullptr; // NOT REACHED
 }
 
-template <class K, class V, class D>
+template <class K, class V, class D, bool isHotColdLog>
 template <class RC>
-inline Status FasterKv<K, V, D>::Read(RC& context, AsyncCallback callback,
+inline Status FasterKv<K, V, D, isHotColdLog>::Read(RC& context, AsyncCallback callback,
                                       uint64_t monotonic_serial_num) {
   typedef RC read_context_t;
   typedef PendingReadContext<RC> pending_read_context_t;
@@ -568,24 +620,38 @@ inline Status FasterKv<K, V, D>::Read(RC& context, AsyncCallback callback,
                 "alignof(value_t) != alignof(typename read_context_t::value_t)");
 
   pending_read_context_t pending_context{ context, callback };
+  pending_context.set_is_hotlog_phase(isHotColdLog);
   OperationStatus internal_status = InternalRead(pending_context);
   Status status;
   if(internal_status == OperationStatus::SUCCESS) {
     status = Status::Ok;
   } else if(internal_status == OperationStatus::NOT_FOUND) {
+    if (isHotColdLog) {
+      status = cold_faster_->Read(context, callback, monotonic_serial_num);
+    } else {
+      status = Status::NotFound;
+    }
+  } else if (internal_status == OperationStatus::NOT_FOUND_HOTLOG_TOMBSTONE) {
+    assert(isHotColdLog);
     status = Status::NotFound;
   } else {
     assert(internal_status == OperationStatus::RECORD_ON_DISK);
     bool async;
     status = HandleOperationStatus(thread_ctx(), pending_context, internal_status, async);
+    if (status == Status::NotFound && isHotColdLog) {
+      status = cold_faster_->Read(context, callback, monotonic_serial_num);
+    } else if (status == Status::NotFoundHotLogTombstone) {
+      assert(isHotColdLog);
+      status = Status::NotFound;
+    }
   }
   thread_ctx().serial_num = monotonic_serial_num;
   return status;
 }
 
-template <class K, class V, class D>
+template <class K, class V, class D, bool isHotColdLog>
 template <class UC>
-inline Status FasterKv<K, V, D>::Upsert(UC& context, AsyncCallback callback,
+inline Status FasterKv<K, V, D, isHotColdLog>::Upsert(UC& context, AsyncCallback callback,
                                         uint64_t monotonic_serial_num) {
   typedef UC upsert_context_t;
   typedef PendingUpsertContext<UC> pending_upsert_context_t;
@@ -608,9 +674,9 @@ inline Status FasterKv<K, V, D>::Upsert(UC& context, AsyncCallback callback,
   return status;
 }
 
-template <class K, class V, class D>
+template <class K, class V, class D, bool isHotColdLog>
 template <class MC>
-inline Status FasterKv<K, V, D>::Rmw(MC& context, AsyncCallback callback,
+inline Status FasterKv<K, V, D, isHotColdLog>::Rmw(MC& context, AsyncCallback callback,
                                      uint64_t monotonic_serial_num) {
   typedef MC rmw_context_t;
   typedef PendingRmwContext<MC> pending_rmw_context_t;
@@ -624,6 +690,8 @@ inline Status FasterKv<K, V, D>::Rmw(MC& context, AsyncCallback callback,
   Status status;
   if(internal_status == OperationStatus::SUCCESS) {
     status = Status::Ok;
+  } else if (internal_status == OperationStatus::COLD_LOG_QUERY_ISSUED) {
+    status = Status::Pending;
   } else {
     bool async;
     status = HandleOperationStatus(thread_ctx(), pending_context, internal_status, async);
@@ -632,9 +700,9 @@ inline Status FasterKv<K, V, D>::Rmw(MC& context, AsyncCallback callback,
   return status;
 }
 
-template <class K, class V, class D>
+template <class K, class V, class D, bool isHotColdLog>
 template <class DC>
-inline Status FasterKv<K, V, D>::Delete(DC& context, AsyncCallback callback,
+inline Status FasterKv<K, V, D, isHotColdLog>::Delete(DC& context, AsyncCallback callback,
                                         uint64_t monotonic_serial_num) {
   typedef DC delete_context_t;
   typedef PendingDeleteContext<DC> pending_delete_context_t;
@@ -658,8 +726,8 @@ inline Status FasterKv<K, V, D>::Delete(DC& context, AsyncCallback callback,
   return status;
 }
 
-template <class K, class V, class D>
-inline bool FasterKv<K, V, D>::CompletePending(bool wait) {
+template <class K, class V, class D, bool isHotColdLog>
+inline bool FasterKv<K, V, D, isHotColdLog>::CompletePending(bool wait) {
   do {
     disk.TryComplete();
 
@@ -685,8 +753,8 @@ inline bool FasterKv<K, V, D>::CompletePending(bool wait) {
   return false;
 }
 
-template <class K, class V, class D>
-inline void FasterKv<K, V, D>::CompleteIoPendingRequests(ExecutionContext& context) {
+template <class K, class V, class D, bool isHotColdLog>
+inline void FasterKv<K, V, D, isHotColdLog>::CompleteIoPendingRequests(ExecutionContext& context) {
   AsyncIOContext* ctxt;
   // Clear this thread's I/O response queue. (Does not clear I/Os issued by this thread that have
   // not yet completed.)
@@ -710,10 +778,42 @@ inline void FasterKv<K, V, D>::CompleteIoPendingRequests(ExecutionContext& conte
     if(internal_status == OperationStatus::SUCCESS) {
       result = Status::Ok;
     } else if(internal_status == OperationStatus::NOT_FOUND) {
+      if(pending_context->type == OperationType::Read) {
+        if (isHotColdLog) {
+          WrappedAsyncPendingReadContext<K, V> wctxt(static_cast<async_pending_read_context_t*>(pending_context.get()));
+          result = cold_faster_->Read(wctxt, pending_context->caller_callback, thread_ctx().serial_num);
+          assert(result == Status::Ok || result == Status::NotFound || result == Status::Pending);
+          pending_context.async = (result == Status::Pending);
+        } else {
+          result = Status::NotFound;
+        }
+      } else {
+        assert(pending_context->type != OperationType::RMW);
+        result = Status::NotFound;
+      }
+    } else if(internal_status == OperationStatus::NOT_FOUND_HOTLOG_TOMBSTONE) {
       result = Status::NotFound;
+    } else if(internal_status == OperationStatus::COLD_LOG_QUERY_ISSUED) {
+      // The cold log is now responsible for completing the operation. We don't need to do anything more.
+      //
+      result = Status::Pending;
+      pending_context.async = true;
     } else {
       result = HandleOperationStatus(context, *pending_context.get(), internal_status,
                                      pending_context.async);
+      if(pending_context->type == OperationType::Read) {
+        if (internal_status == OperationStatus::NOT_FOUND_UNMARK && isHotColdLog) {
+          assert(!pending_context.async);
+          WrappedAsyncPendingReadContext<K, V> wctxt(static_cast<async_pending_read_context_t*>(pending_context.get()));
+          result = cold_faster_->Read(wctxt, pending_context->caller_callback, thread_ctx().serial_num);
+          assert(result == Status::Ok || result == Status::NotFound || result == Status::Pending);
+          pending_context.async = (result == Status::Pending);
+        } else if (internal_status == OperationStatus::NOT_FOUND_UNMARK_HOTLOG_TOMBSTONE) {
+          assert(isHotColdLog && result == Status::NotFound);
+        }
+      } else {
+        // TODO: handle other operations
+      }
     }
     if(!pending_context.async) {
       pending_context->caller_callback(pending_context->caller_context, result);
@@ -721,8 +821,8 @@ inline void FasterKv<K, V, D>::CompleteIoPendingRequests(ExecutionContext& conte
   }
 }
 
-template <class K, class V, class D>
-inline void FasterKv<K, V, D>::CompleteRetryRequests(ExecutionContext& context) {
+template <class K, class V, class D, bool isHotColdLog>
+inline void FasterKv<K, V, D, isHotColdLog>::CompleteRetryRequests(ExecutionContext& context) {
   // If we can't complete a request, it will be pushed back onto the deque. Retry each request
   // only once.
   size_t size = context.retry_requests.size();
@@ -760,9 +860,9 @@ inline void FasterKv<K, V, D>::CompleteRetryRequests(ExecutionContext& context) 
   }
 }
 
-template <class K, class V, class D>
+template <class K, class V, class D, bool isHotColdLog>
 template <class C>
-inline OperationStatus FasterKv<K, V, D>::InternalRead(C& pending_context) const {
+inline OperationStatus FasterKv<K, V, D, isHotColdLog>::InternalRead(C& pending_context) const {
   typedef C pending_read_context_t;
 
   if(thread_ctx().phase != Phase::REST) {
@@ -812,7 +912,14 @@ inline OperationStatus FasterKv<K, V, D>::InternalRead(C& pending_context) const
     // Mutable or fuzzy region
     // concurrent read
     if (reinterpret_cast<const record_t*>(hlog.Get(address))->header.tombstone) {
-      return OperationStatus::NOT_FOUND;
+      if (isHotColdLog)
+      {
+        return OperationStatus::NOT_FOUND_HOTLOG_TOMBSTONE;
+      }
+      else
+      {
+        return OperationStatus::NOT_FOUND;
+      }
     }
     pending_context.GetAtomic(hlog.Get(address));
     return OperationStatus::SUCCESS;
@@ -820,7 +927,14 @@ inline OperationStatus FasterKv<K, V, D>::InternalRead(C& pending_context) const
     // Immutable region
     // single-thread read
     if (reinterpret_cast<const record_t*>(hlog.Get(address))->header.tombstone) {
-      return OperationStatus::NOT_FOUND;
+      if (isHotColdLog)
+      {
+        return OperationStatus::NOT_FOUND_HOTLOG_TOMBSTONE;
+      }
+      else
+      {
+        return OperationStatus::NOT_FOUND;
+      }
     }
     pending_context.Get(hlog.Get(address));
     return OperationStatus::SUCCESS;
@@ -834,9 +948,9 @@ inline OperationStatus FasterKv<K, V, D>::InternalRead(C& pending_context) const
   }
 }
 
-template <class K, class V, class D>
+template <class K, class V, class D, bool isHotColdLog>
 template <class C>
-inline OperationStatus FasterKv<K, V, D>::InternalUpsert(C& pending_context) {
+inline OperationStatus FasterKv<K, V, D, isHotColdLog>::InternalUpsert(C& pending_context) {
   typedef C pending_upsert_context_t;
 
   if(thread_ctx().phase != Phase::REST) {
@@ -972,9 +1086,9 @@ create_record:
   }
 }
 
-template <class K, class V, class D>
+template <class K, class V, class D, bool isHotColdLog>
 template <class C>
-inline OperationStatus FasterKv<K, V, D>::InternalRmw(C& pending_context, bool retrying) {
+inline OperationStatus FasterKv<K, V, D, isHotColdLog>::InternalRmw(C& pending_context, bool retrying) {
   typedef C pending_rmw_context_t;
 
   Phase phase = retrying ? pending_context.phase : thread_ctx().phase;
@@ -1124,11 +1238,30 @@ inline OperationStatus FasterKv<K, V, D>::InternalRmw(C& pending_context, bool r
 
   // Create a record and attempt RCU.
 create_record:
+  bool shouldCheckColdLog = isHotColdLog;
   const record_t* old_record = nullptr;
   if(address >= head_address) {
     old_record = reinterpret_cast<const record_t*>(hlog.Get(address));
     if(old_record->header.tombstone) {
       old_record = nullptr;
+    }
+    // no matter if old_record is a tombstone, or old_record is not a tombstone but RmwAtomic() failed,
+    // we should not check cold log, because the record (or its tombstone) exists in hot log
+    //
+    shouldCheckColdLog = false;
+  }
+  if (shouldCheckColdLog)
+  {
+    // TODO: handle case that cold log directly returned
+    async_pending_rmw_context_t* ctxt = &pending_context;
+    IAsyncContext* copy_;
+    ctxt->DeepCopy(copy_);
+    async_pending_rmw_context_t* copy = static_cast<async_pending_rmw_context_t*>(copy_);
+    bool isDone = RmwIssueColdLogQuery(thread_ctx(), copy);
+    if (isDone) {
+      return OperationStatus::SUCCESS;
+    } else {
+      return OperationStatus::COLD_LOG_QUERY_ISSUED;
     }
   }
   uint32_t record_size = old_record != nullptr ?
@@ -1185,8 +1318,8 @@ create_record:
   }
 }
 
-template <class K, class V, class D>
-inline OperationStatus FasterKv<K, V, D>::InternalRetryPendingRmw(
+template <class K, class V, class D, bool isHotColdLog>
+inline OperationStatus FasterKv<K, V, D, isHotColdLog>::InternalRetryPendingRmw(
   async_pending_rmw_context_t& pending_context) {
   OperationStatus status = InternalRmw(pending_context, true);
   if(status == OperationStatus::SUCCESS && pending_context.version != thread_ctx().version) {
@@ -1195,9 +1328,9 @@ inline OperationStatus FasterKv<K, V, D>::InternalRetryPendingRmw(
   return status;
 }
 
-template <class K, class V, class D>
+template <class K, class V, class D, bool isHotColdLog>
 template<class C>
-inline OperationStatus FasterKv<K, V, D>::InternalDelete(C& pending_context) {
+inline OperationStatus FasterKv<K, V, D, isHotColdLog>::InternalDelete(C& pending_context) {
   typedef C pending_delete_context_t;
 
   if(thread_ctx().phase != Phase::REST) {
@@ -1207,9 +1340,23 @@ inline OperationStatus FasterKv<K, V, D>::InternalDelete(C& pending_context) {
   KeyHash hash = pending_context.get_key_hash();
   HashBucketEntry expected_entry;
   AtomicHashBucketEntry* atomic_entry = const_cast<AtomicHashBucketEntry*>(FindEntry(hash, expected_entry));
+
   if(!atomic_entry) {
     // no record found
-    return OperationStatus::NOT_FOUND;
+    if (isHotColdLog) {
+      WrappedAsyncPendingDeleteContext<K, V> ctxt(&pending_context);
+      Status r = cold_faster_->Delete(ctxt, pending_context.caller_callback, thread_ctx().serial_num);
+      assert(r == Status::Pending || r == Status::NotFound || r == Status::Ok);
+      if (r == Status::Pending) {
+        return OperationStatus::COLD_LOG_QUERY_ISSUED;
+      } else if (r == Status::NotFound) {
+        return OperationStatus::NOT_FOUND;
+      } else {
+        return OperationStatus::SUCCESS;
+      }
+    } else {
+      return OperationStatus::NOT_FOUND;
+    }
   }
 
   Address address = expected_entry.address();
@@ -1284,10 +1431,15 @@ inline OperationStatus FasterKv<K, V, D>::InternalDelete(C& pending_context) {
     record_t* record = reinterpret_cast<record_t*>(hlog.Get(address));
     // If the record is the head of the hash chain, try to update the hash chain and completely
     // elide record only if the previous address points to invalid address
-    if(expected_entry.address() == address) {
-      Address previous_address = record->header.previous_address();
-      if (previous_address < begin_address) {
-        atomic_entry->compare_exchange_strong(expected_entry, HashBucketEntry::kInvalidEntry);
+    // We can only do this when we don't have hot-cold-log separation:
+    // in hot-cold-log, the tombstone indicates that the key is invalid in cold log even if it exists,
+    // so we must not delete it.
+    if (!isHotColdLog) {
+      if(expected_entry.address() == address) {
+        Address previous_address = record->header.previous_address();
+        if (previous_address < begin_address) {
+          atomic_entry->compare_exchange_strong(expected_entry, HashBucketEntry::kInvalidEntry);
+        }
       }
     }
     record->header.tombstone = true;
@@ -1317,9 +1469,9 @@ create_record:
   }
 }
 
-template <class K, class V, class D>
+template <class K, class V, class D, bool isHotColdLog>
 template<class C>
-inline Address FasterKv<K, V, D>::TraceBackForKeyMatchCtxt(const C& ctxt, Address from_address,
+inline Address FasterKv<K, V, D, isHotColdLog>::TraceBackForKeyMatchCtxt(const C& ctxt, Address from_address,
     Address min_offset) const {
   while(from_address >= min_offset) {
     const record_t* record = reinterpret_cast<const record_t*>(hlog.Get(from_address));
@@ -1333,8 +1485,8 @@ inline Address FasterKv<K, V, D>::TraceBackForKeyMatchCtxt(const C& ctxt, Addres
   return from_address;
 }
 
-template <class K, class V, class D>
-inline Address FasterKv<K, V, D>::TraceBackForKeyMatch(const key_t& key, Address from_address,
+template <class K, class V, class D, bool isHotColdLog>
+inline Address FasterKv<K, V, D, isHotColdLog>::TraceBackForKeyMatch(const key_t& key, Address from_address,
                                                        Address min_offset) const {
   while(from_address >= min_offset) {
     const record_t* record = reinterpret_cast<const record_t*>(hlog.Get(from_address));
@@ -1348,8 +1500,8 @@ inline Address FasterKv<K, V, D>::TraceBackForKeyMatch(const key_t& key, Address
   return from_address;
 }
 
-template <class K, class V, class D>
-inline Status FasterKv<K, V, D>::HandleOperationStatus(ExecutionContext& ctx,
+template <class K, class V, class D, bool isHotColdLog>
+inline Status FasterKv<K, V, D, isHotColdLog>::HandleOperationStatus(ExecutionContext& ctx,
     pending_context_t& pending_context, OperationStatus internal_status, bool& async) {
   async = false;
   switch(internal_status) {
@@ -1385,6 +1537,8 @@ inline Status FasterKv<K, V, D>::HandleOperationStatus(ExecutionContext& ctx,
       return Status::Ok;
     } else if(internal_status == OperationStatus::NOT_FOUND) {
       return Status::NotFound;
+    } else if (internal_status == OperationStatus::NOT_FOUND_HOTLOG_TOMBSTONE) {
+      return Status::NotFoundHotLogTombstone;
     } else {
       return HandleOperationStatus(ctx, pending_context, internal_status, async);
     }
@@ -1415,14 +1569,17 @@ inline Status FasterKv<K, V, D>::HandleOperationStatus(ExecutionContext& ctx,
     return Status::NotFound;
   case OperationStatus::CPR_SHIFT_DETECTED:
     return PivotAndRetry(ctx, pending_context, async);
+  case OperationStatus::COLD_LOG_QUERY_ISSUED:
+    async = true;
+    return Status::Pending;
   }
   // not reached
   assert(false);
   return Status::Corruption;
 }
 
-template <class K, class V, class D>
-inline Status FasterKv<K, V, D>::PivotAndRetry(ExecutionContext& ctx,
+template <class K, class V, class D, bool isHotColdLog>
+inline Status FasterKv<K, V, D, isHotColdLog>::PivotAndRetry(ExecutionContext& ctx,
     pending_context_t& pending_context, bool& async) {
   // Some invariants
   assert(ctx.version == thread_ctx().version);
@@ -1436,8 +1593,8 @@ inline Status FasterKv<K, V, D>::PivotAndRetry(ExecutionContext& ctx,
   return HandleOperationStatus(thread_ctx(), pending_context, OperationStatus::RETRY_NOW, async);
 }
 
-template <class K, class V, class D>
-inline Status FasterKv<K, V, D>::RetryLater(ExecutionContext& ctx,
+template <class K, class V, class D, bool isHotColdLog>
+inline Status FasterKv<K, V, D, isHotColdLog>::RetryLater(ExecutionContext& ctx,
     pending_context_t& pending_context, bool& async) {
   IAsyncContext* context_copy;
   Status result = pending_context.DeepCopy(context_copy);
@@ -1451,15 +1608,15 @@ inline Status FasterKv<K, V, D>::RetryLater(ExecutionContext& ctx,
   }
 }
 
-template <class K, class V, class D>
-inline constexpr uint32_t FasterKv<K, V, D>::MinIoRequestSize() const {
+template <class K, class V, class D, bool isHotColdLog>
+inline constexpr uint32_t FasterKv<K, V, D, isHotColdLog>::MinIoRequestSize() const {
   return static_cast<uint32_t>(
            sizeof(value_t) + pad_alignment(record_t::min_disk_key_size(),
                alignof(value_t)));
 }
 
-template <class K, class V, class D>
-inline Status FasterKv<K, V, D>::IssueAsyncIoRequest(ExecutionContext& ctx,
+template <class K, class V, class D, bool isHotColdLog>
+inline Status FasterKv<K, V, D, isHotColdLog>::IssueAsyncIoRequest(ExecutionContext& ctx,
     pending_context_t& pending_context, bool& async) {
   // Issue asynchronous I/O request
   uint64_t io_id = thread_ctx().io_id++;
@@ -1472,8 +1629,8 @@ inline Status FasterKv<K, V, D>::IssueAsyncIoRequest(ExecutionContext& ctx,
   return Status::Pending;
 }
 
-template <class K, class V, class D>
-inline Address FasterKv<K, V, D>::BlockAllocate(uint32_t record_size) {
+template <class K, class V, class D, bool isHotColdLog>
+inline Address FasterKv<K, V, D, isHotColdLog>::BlockAllocate(uint32_t record_size) {
   uint32_t page;
   Address retval = hlog.Allocate(record_size, page);
   while(retval < hlog.read_only_address.load()) {
@@ -1489,8 +1646,8 @@ inline Address FasterKv<K, V, D>::BlockAllocate(uint32_t record_size) {
   return retval;
 }
 
-template <class K, class V, class D>
-void FasterKv<K, V, D>::AsyncGetFromDisk(Address address, uint32_t num_records,
+template <class K, class V, class D, bool isHotColdLog>
+void FasterKv<K, V, D, isHotColdLog>::AsyncGetFromDisk(Address address, uint32_t num_records,
     AsyncIOCallback callback, AsyncIOContext& context) {
   if(epoch_.IsProtected()) {
     /// Throttling. (Thread pool, unprotected threads are not throttled.)
@@ -1504,8 +1661,8 @@ void FasterKv<K, V, D>::AsyncGetFromDisk(Address address, uint32_t num_records,
   hlog.AsyncGetFromDisk(address, num_records, callback, context);
 }
 
-template <class K, class V, class D>
-void FasterKv<K, V, D>::AsyncGetFromDiskCallback(IAsyncContext* ctxt, Status result,
+template <class K, class V, class D, bool isHotColdLog>
+void FasterKv<K, V, D, isHotColdLog>::AsyncGetFromDiskCallback(IAsyncContext* ctxt, Status result,
     size_t bytes_transferred) {
   CallbackContext<AsyncIOContext> context{ ctxt };
   faster_t* faster = reinterpret_cast<faster_t*>(context->faster);
@@ -1556,16 +1713,21 @@ void FasterKv<K, V, D>::AsyncGetFromDiskCallback(IAsyncContext* ctxt, Status res
   }
 }
 
-template <class K, class V, class D>
-OperationStatus FasterKv<K, V, D>::InternalContinuePendingRead(ExecutionContext& context,
+template <class K, class V, class D, bool isHotColdLog>
+OperationStatus FasterKv<K, V, D, isHotColdLog>::InternalContinuePendingRead(ExecutionContext& context,
     AsyncIOContext& io_context) {
   if(io_context.address >= hlog.begin_address.load()) {
     async_pending_read_context_t* pending_context = static_cast<async_pending_read_context_t*>(
           io_context.caller_context);
     record_t* record = reinterpret_cast<record_t*>(io_context.record.GetValidPointer());
     if(record->header.tombstone) {
-      return (thread_ctx().version > context.version) ? OperationStatus::NOT_FOUND_UNMARK :
-             OperationStatus::NOT_FOUND;
+      if (isHotColdLog) {
+        return (thread_ctx().version > context.version) ? OperationStatus::NOT_FOUND_UNMARK_HOTLOG_TOMBSTONE :
+               OperationStatus::NOT_FOUND_HOTLOG_TOMBSTONE;
+      } else {
+        return (thread_ctx().version > context.version) ? OperationStatus::NOT_FOUND_UNMARK :
+               OperationStatus::NOT_FOUND;
+      }
     }
     pending_context->Get(record);
     assert(!kCopyReadsToTail);
@@ -1577,12 +1739,70 @@ OperationStatus FasterKv<K, V, D>::InternalContinuePendingRead(ExecutionContext&
   }
 }
 
-template <class K, class V, class D>
-OperationStatus FasterKv<K, V, D>::InternalContinuePendingRmw(ExecutionContext& context,
-    AsyncIOContext& io_context) {
-  async_pending_rmw_context_t* pending_context = static_cast<async_pending_rmw_context_t*>(
-        io_context.caller_context);
+template <class K, class V, class D, bool isHotColdLog>
+bool FasterKv<K, V, D, isHotColdLog>::RmwIssueColdLogQuery(
+    ExecutionContext& context,
+    async_pending_rmw_context_t* pending_context)
+{
+  // TODO: fix 'context'
+  auto wrapped_user_cb = [](IAsyncContext* ctxt_, Status result) {
+    if (result == Status::NotFound)
+    {
+      WrappedAsyncPendingReadContextForRmw<K, V>* ctxt = static_cast<WrappedAsyncPendingReadContextForRmw<K, V>*>(ctxt_);
+      ctxt->rmw_callback_(ctxt, nullptr);
+    }
+  };
+  ExecutionContext* ecPtr = &context;
+  std::function<void(WrappedAsyncPendingReadContextForRmw<K, V>*, const value_t*)> cb = [this, ecPtr, wrapped_user_cb, &cb]
+      (WrappedAsyncPendingReadContextForRmw<K, V>* ctxt, const value_t* value)
+  {
+    OperationStatus status = InternalContinuePendingRmwInternal(*ecPtr, ctxt->ctxt_, false /*fromIoContext*/,
+                                       Address(), nullptr /*disk_record*/, value);
+    assert(status == OperationStatus::SUCCESS || status == OperationStatus::SUCCESS_UNMARK ||
+           status == OperationStatus::RETRY_NOW);
+    if (status == OperationStatus::SUCCESS_UNMARK || status == OperationStatus::SUCCESS)
+    {
+      if (status == OperationStatus::SUCCESS_UNMARK)
+      {
+        checkpoint_locks_.get_lock(ctxt->ctxt_->get_key_hash()).unlock_old();
+      }
+      if (ctxt->from_deep_copy()) {
+        ctxt->ctxt_->caller_callback(ctxt->ctxt_, Status::Ok);
+      }
+      ctxt->isDone = true;
+    }
+    else if (status == OperationStatus::RETRY_NOW)
+    {
+      Status result = cold_faster_->Read(*ctxt, wrapped_user_cb, ecPtr->serial_num);
+      assert(result == Status::Ok || result == Status::NotFound || result == Status::Pending);
+      if (result == Status::NotFound)
+      {
+        wrapped_user_cb(ctxt, result);
+      }
+    }
+  };
+  WrappedAsyncPendingReadContextForRmw<K, V> readCtxt(pending_context, cb);
+  Status result = cold_faster_->Read(readCtxt, wrapped_user_cb, ecPtr->serial_num);
+  assert(result == Status::Ok || result == Status::NotFound || result == Status::Pending);
+  if (result == Status::NotFound)
+  {
+    wrapped_user_cb(&readCtxt, result);
+  }
+  return readCtxt.isDone;
+}
 
+template <class K, class V, class D, bool isHotColdLog>
+OperationStatus FasterKv<K, V, D, isHotColdLog>::InternalContinuePendingRmwInternal(
+    ExecutionContext& context,
+    async_pending_rmw_context_t* pending_context,
+    bool fromIoContext,
+    // If fromIoContext is true, the address of the record
+    Address ioContextAddress,
+    // If fromIoContext is true, the record
+    const record_t* disk_record,
+    // If not fromIoContext, the value
+    const value_t* disk_value)
+{
   // Find a hash bucket entry to store the updated value in.
   KeyHash hash = pending_context->get_key_hash();
   HashBucketEntry expected_entry;
@@ -1610,8 +1830,18 @@ OperationStatus FasterKv<K, V, D>::InternalContinuePendingRmw(ExecutionContext& 
   // We have to do copy-on-write/RCU and write the updated value to the tail of the log.
   Address new_address;
   record_t* new_record;
-  if(io_context.address < hlog.begin_address.load()) {
+  if((fromIoContext && ioContextAddress < hlog.begin_address.load()) ||
+     (!fromIoContext && disk_value == nullptr)) {
     // The on-disk trace back failed to find a key match.
+    if (isHotColdLog && fromIoContext) {
+      // continue searching on the cold log
+      bool isDone = RmwIssueColdLogQuery(context, pending_context);
+      if (!isDone) {
+        return OperationStatus::COLD_LOG_QUERY_ISSUED;
+      } else {
+        return OperationStatus::SUCCESS;
+      }
+    }
     uint32_t record_size = record_t::size(pending_context->key_size(), pending_context->value_size());
     new_address = BlockAllocate(record_size);
     new_record = reinterpret_cast<record_t*>(hlog.Get(new_address));
@@ -1624,10 +1854,17 @@ OperationStatus FasterKv<K, V, D>::InternalContinuePendingRmw(ExecutionContext& 
     pending_context->write_deep_key_at(const_cast<key_t*>(&new_record->key()));
     pending_context->RmwInitial(new_record);
   } else {
-    // The record we read from disk.
-    const record_t* disk_record = reinterpret_cast<const record_t*>(
-                                    io_context.record.GetValidPointer());
-    uint32_t record_size = record_t::size(pending_context->key_size(), pending_context->value_size(disk_record));
+    uint32_t record_size;
+    if (fromIoContext) {
+      if (!disk_record->header.tombstone) {
+        record_size = record_t::size(pending_context->key_size(), pending_context->value_size(disk_record));
+      } else {
+        record_size = record_t::size(pending_context->key_size(), pending_context->value_size());
+      }
+    } else {
+        record_size = record_t::size(pending_context->key_size(), pending_context->value_size_v(disk_value));
+    }
+
     new_address = BlockAllocate(record_size);
     new_record = reinterpret_cast<record_t*>(hlog.Get(new_address));
 
@@ -1637,7 +1874,18 @@ OperationStatus FasterKv<K, V, D>::InternalContinuePendingRmw(ExecutionContext& 
         expected_entry.address() },
     };
     pending_context->write_deep_key_at(const_cast<key_t*>(&new_record->key()));
-    pending_context->RmwCopy(disk_record, new_record);
+    if (fromIoContext && !disk_record->header.tombstone)
+    {
+      pending_context->RmwCopy(disk_record, new_record);
+    }
+    else if (!fromIoContext)
+    {
+      pending_context->RmwCopyV(disk_value, &new_record->value());
+    }
+    else
+    {
+      pending_context->RmwInitial(new_record);
+    }
   }
 
   HashBucketEntry updated_entry{ new_address, hash.tag(), false };
@@ -1653,15 +1901,27 @@ OperationStatus FasterKv<K, V, D>::InternalContinuePendingRmw(ExecutionContext& 
   }
 }
 
-template <class K, class V, class D>
-void FasterKv<K, V, D>::InitializeCheckpointLocks() {
+template <class K, class V, class D, bool isHotColdLog>
+OperationStatus FasterKv<K, V, D, isHotColdLog>::InternalContinuePendingRmw(
+    ExecutionContext& context, AsyncIOContext& io_context)
+{
+  async_pending_rmw_context_t* pending_context = static_cast<async_pending_rmw_context_t*>(
+        io_context.caller_context);
+  const record_t* disk_record = reinterpret_cast<const record_t*>(
+                                  io_context.record.GetValidPointer());
+  return InternalContinuePendingRmwInternal(context, pending_context, true /*fromIoContext*/,
+                                            io_context.address, disk_record, nullptr /*disk_value*/);
+}
+
+template <class K, class V, class D, bool isHotColdLog>
+void FasterKv<K, V, D, isHotColdLog>::InitializeCheckpointLocks() {
   uint32_t table_version = resize_info_.version;
   uint64_t size = state_[table_version].size();
   checkpoint_locks_.Initialize(size);
 }
 
-template <class K, class V, class D>
-Status FasterKv<K, V, D>::WriteIndexMetadata() {
+template <class K, class V, class D, bool isHotColdLog>
+Status FasterKv<K, V, D, isHotColdLog>::WriteIndexMetadata() {
   std::string filename = disk.index_checkpoint_path(checkpoint_.index_token) + "info.dat";
   // (This code will need to be refactored into the disk_t interface, if we want to support
   // unformatted disks.)
@@ -1679,8 +1939,8 @@ Status FasterKv<K, V, D>::WriteIndexMetadata() {
   return Status::Ok;
 }
 
-template <class K, class V, class D>
-Status FasterKv<K, V, D>::ReadIndexMetadata(const Guid& token) {
+template <class K, class V, class D, bool isHotColdLog>
+Status FasterKv<K, V, D, isHotColdLog>::ReadIndexMetadata(const Guid& token) {
   std::string filename = disk.index_checkpoint_path(token) + "info.dat";
   // (This code will need to be refactored into the disk_t interface, if we want to support
   // unformatted disks.)
@@ -1698,8 +1958,8 @@ Status FasterKv<K, V, D>::ReadIndexMetadata(const Guid& token) {
   return Status::Ok;
 }
 
-template <class K, class V, class D>
-Status FasterKv<K, V, D>::WriteCprMetadata() {
+template <class K, class V, class D, bool isHotColdLog>
+Status FasterKv<K, V, D, isHotColdLog>::WriteCprMetadata() {
   std::string filename = disk.cpr_checkpoint_path(checkpoint_.hybrid_log_token) + "info.dat";
   // (This code will need to be refactored into the disk_t interface, if we want to support
   // unformatted disks.)
@@ -1717,8 +1977,8 @@ Status FasterKv<K, V, D>::WriteCprMetadata() {
   return Status::Ok;
 }
 
-template <class K, class V, class D>
-Status FasterKv<K, V, D>::ReadCprMetadata(const Guid& token) {
+template <class K, class V, class D, bool isHotColdLog>
+Status FasterKv<K, V, D, isHotColdLog>::ReadCprMetadata(const Guid& token) {
   std::string filename = disk.cpr_checkpoint_path(token) + "info.dat";
   // (This code will need to be refactored into the disk_t interface, if we want to support
   // unformatted disks.)
@@ -1736,8 +1996,8 @@ Status FasterKv<K, V, D>::ReadCprMetadata(const Guid& token) {
   return Status::Ok;
 }
 
-template <class K, class V, class D>
-Status FasterKv<K, V, D>::WriteCprContext() {
+template <class K, class V, class D, bool isHotColdLog>
+Status FasterKv<K, V, D, isHotColdLog>::WriteCprContext() {
   std::string filename = disk.cpr_checkpoint_path(checkpoint_.hybrid_log_token);
   const Guid& guid = prev_thread_ctx().guid;
   filename += guid.ToString();
@@ -1759,8 +2019,8 @@ Status FasterKv<K, V, D>::WriteCprContext() {
   return Status::Ok;
 }
 
-template <class K, class V, class D>
-Status FasterKv<K, V, D>::ReadCprContexts(const Guid& token, const Guid* guids) {
+template <class K, class V, class D, bool isHotColdLog>
+Status FasterKv<K, V, D, isHotColdLog>::ReadCprContexts(const Guid& token, const Guid* guids) {
   for(size_t idx = 0; idx < Thread::kMaxNumThreads; ++idx) {
     const Guid& guid = guids[idx];
     if(guid == Guid{}) {
@@ -1793,8 +2053,8 @@ Status FasterKv<K, V, D>::ReadCprContexts(const Guid& token, const Guid* guids) 
   }
 }
 
-template <class K, class V, class D>
-Status FasterKv<K, V, D>::CheckpointFuzzyIndex() {
+template <class K, class V, class D, bool isHotColdLog>
+Status FasterKv<K, V, D, isHotColdLog>::CheckpointFuzzyIndex() {
   uint32_t hash_table_version = resize_info_.version;
   // Checkpoint the main hash table.
   file_t ht_file = disk.NewFile(disk.relative_index_checkpoint_path(checkpoint_.index_token) +
@@ -1812,8 +2072,8 @@ Status FasterKv<K, V, D>::CheckpointFuzzyIndex() {
   return Status::Ok;
 }
 
-template <class K, class V, class D>
-Status FasterKv<K, V, D>::CheckpointFuzzyIndexComplete() {
+template <class K, class V, class D, bool isHotColdLog>
+Status FasterKv<K, V, D, isHotColdLog>::CheckpointFuzzyIndexComplete() {
   if(!checkpoint_.index_checkpoint_started) {
     return Status::Pending;
   }
@@ -1828,8 +2088,8 @@ Status FasterKv<K, V, D>::CheckpointFuzzyIndexComplete() {
   }
 }
 
-template <class K, class V, class D>
-Status FasterKv<K, V, D>::RecoverFuzzyIndex() {
+template <class K, class V, class D, bool isHotColdLog>
+Status FasterKv<K, V, D, isHotColdLog>::RecoverFuzzyIndex() {
   uint8_t hash_table_version = resize_info_.version;
   assert(state_[hash_table_version].size() == checkpoint_.index_metadata.table_size);
 
@@ -1847,8 +2107,8 @@ Status FasterKv<K, V, D>::RecoverFuzzyIndex() {
          checkpoint_.index_metadata.num_ofb_bytes, checkpoint_.index_metadata.ofb_count);
 }
 
-template <class K, class V, class D>
-Status FasterKv<K, V, D>::RecoverFuzzyIndexComplete(bool wait) {
+template <class K, class V, class D, bool isHotColdLog>
+Status FasterKv<K, V, D, isHotColdLog>::RecoverFuzzyIndexComplete(bool wait) {
   uint8_t hash_table_version = resize_info_.version;
   Status result = state_[hash_table_version].RecoverComplete(true);
   if(result != Status::Ok) {
@@ -1881,8 +2141,8 @@ Status FasterKv<K, V, D>::RecoverFuzzyIndexComplete(bool wait) {
   return Status::Ok;
 }
 
-template <class K, class V, class D>
-Status FasterKv<K, V, D>::RecoverHybridLog() {
+template <class K, class V, class D, bool isHotColdLog>
+Status FasterKv<K, V, D, isHotColdLog>::RecoverHybridLog() {
   class Context : public IAsyncContext {
    public:
     Context(hlog_t& hlog_, uint32_t page_, RecoveryStatus& recovery_status_)
@@ -1952,8 +2212,8 @@ Status FasterKv<K, V, D>::RecoverHybridLog() {
   return Status::Ok;
 }
 
-template <class K, class V, class D>
-Status FasterKv<K, V, D>::RecoverHybridLogFromSnapshotFile() {
+template <class K, class V, class D, bool isHotColdLog>
+Status FasterKv<K, V, D, isHotColdLog>::RecoverHybridLogFromSnapshotFile() {
   class Context : public IAsyncContext {
    public:
     Context(hlog_t& hlog_, file_t& file_, uint32_t file_start_page_, uint32_t page_,
@@ -2042,8 +2302,8 @@ Status FasterKv<K, V, D>::RecoverHybridLogFromSnapshotFile() {
   return Status::Ok;
 }
 
-template <class K, class V, class D>
-Status FasterKv<K, V, D>::RecoverFromPage(Address from_address, Address to_address) {
+template <class K, class V, class D, bool isHotColdLog>
+Status FasterKv<K, V, D, isHotColdLog>::RecoverFromPage(Address from_address, Address to_address) {
   assert(from_address.page() == to_address.page());
   for(Address address = from_address; address < to_address;) {
     record_t* record = reinterpret_cast<record_t*>(hlog.Get(address));
@@ -2076,8 +2336,8 @@ Status FasterKv<K, V, D>::RecoverFromPage(Address from_address, Address to_addre
   return Status::Ok;
 }
 
-template <class K, class V, class D>
-Status FasterKv<K, V, D>::RestoreHybridLog() {
+template <class K, class V, class D, bool isHotColdLog>
+Status FasterKv<K, V, D, isHotColdLog>::RestoreHybridLog() {
   Address tail_address = checkpoint_.log_metadata.final_address;
   uint32_t end_page = tail_address.offset() > 0 ? tail_address.page() + 1 : tail_address.page();
   uint32_t capacity = hlog.buffer_size();
@@ -2107,8 +2367,8 @@ Status FasterKv<K, V, D>::RestoreHybridLog() {
   return Status::Ok;
 }
 
-template <class K, class V, class D>
-void FasterKv<K, V, D>::HeavyEnter() {
+template <class K, class V, class D, bool isHotColdLog>
+void FasterKv<K, V, D, isHotColdLog>::HeavyEnter() {
   if(thread_ctx().phase == Phase::GC_IO_PENDING || thread_ctx().phase == Phase::GC_IN_PROGRESS) {
     CleanHashTableBuckets();
     return;
@@ -2124,8 +2384,8 @@ void FasterKv<K, V, D>::HeavyEnter() {
   }
 }
 
-template <class K, class V, class D>
-bool FasterKv<K, V, D>::CleanHashTableBuckets() {
+template <class K, class V, class D, bool isHotColdLog>
+bool FasterKv<K, V, D, isHotColdLog>::CleanHashTableBuckets() {
   uint64_t chunk = gc_.next_chunk++;
   if(chunk >= gc_.num_chunks) {
     // No chunk left to clean.
@@ -2167,8 +2427,8 @@ bool FasterKv<K, V, D>::CleanHashTableBuckets() {
   return true;
 }
 
-template <class K, class V, class D>
-void FasterKv<K, V, D>::AddHashEntry(HashBucket*& bucket, uint32_t& next_idx, uint8_t version,
+template <class K, class V, class D, bool isHotColdLog>
+void FasterKv<K, V, D, isHotColdLog>::AddHashEntry(HashBucket*& bucket, uint32_t& next_idx, uint8_t version,
                                      HashBucketEntry entry) {
   if(next_idx == HashBucket::kNumEntries) {
     // Need to allocate a new bucket, first.
@@ -2182,8 +2442,8 @@ void FasterKv<K, V, D>::AddHashEntry(HashBucket*& bucket, uint32_t& next_idx, ui
   ++next_idx;
 }
 
-template <class K, class V, class D>
-Address FasterKv<K, V, D>::TraceBackForOtherChainStart(uint64_t old_size, uint64_t new_size,
+template <class K, class V, class D, bool isHotColdLog>
+Address FasterKv<K, V, D, isHotColdLog>::TraceBackForOtherChainStart(uint64_t old_size, uint64_t new_size,
     Address from_address, Address min_address, uint8_t side) {
   assert(side == 0 || side == 1);
   // Search back as far as min_address.
@@ -2199,8 +2459,8 @@ Address FasterKv<K, V, D>::TraceBackForOtherChainStart(uint64_t old_size, uint64
   return from_address;
 }
 
-template <class K, class V, class D>
-void FasterKv<K, V, D>::SplitHashTableBuckets() {
+template <class K, class V, class D, bool isHotColdLog>
+void FasterKv<K, V, D, isHotColdLog>::SplitHashTableBuckets() {
   // This thread won't exit until all hash table buckets have been split.
   Address head_address = hlog.head_address.load();
   Address begin_address = hlog.begin_address.load();
@@ -2300,8 +2560,8 @@ void FasterKv<K, V, D>::SplitHashTableBuckets() {
   }
 }
 
-template <class K, class V, class D>
-bool FasterKv<K, V, D>::GlobalMoveToNextState(SystemState current_state) {
+template <class K, class V, class D, bool isHotColdLog>
+bool FasterKv<K, V, D, isHotColdLog>::GlobalMoveToNextState(SystemState current_state) {
   SystemState next_state = current_state.GetNextState();
   if(!system_state_.compare_exchange_strong(current_state, next_state)) {
     return false;
@@ -2476,8 +2736,8 @@ bool FasterKv<K, V, D>::GlobalMoveToNextState(SystemState current_state) {
   return true;
 }
 
-template <class K, class V, class D>
-void FasterKv<K, V, D>::MarkAllPendingRequests() {
+template <class K, class V, class D, bool isHotColdLog>
+void FasterKv<K, V, D, isHotColdLog>::MarkAllPendingRequests() {
   uint32_t table_version = resize_info_.version;
   uint64_t table_size = state_[table_version].size();
 
@@ -2496,8 +2756,8 @@ void FasterKv<K, V, D>::MarkAllPendingRequests() {
   }
 }
 
-template <class K, class V, class D>
-void FasterKv<K, V, D>::HandleSpecialPhases() {
+template <class K, class V, class D, bool isHotColdLog>
+void FasterKv<K, V, D, isHotColdLog>::HandleSpecialPhases() {
   SystemState final_state = system_state_.load();
   if(final_state.phase == Phase::REST) {
     // Nothing to do; just reset thread context.
@@ -2706,8 +2966,8 @@ void FasterKv<K, V, D>::HandleSpecialPhases() {
   } while(previous_state != final_state);
 }
 
-template <class K, class V, class D>
-bool FasterKv<K, V, D>::Checkpoint(void(*index_persistence_callback)(Status result),
+template <class K, class V, class D, bool isHotColdLog>
+bool FasterKv<K, V, D, isHotColdLog>::Checkpoint(void(*index_persistence_callback)(Status result),
                                    void(*hybrid_log_persistence_callback)(Status result,
                                        uint64_t persistent_serial_num), Guid& token) {
   // Only one thread can initiate a checkpoint at a time.
@@ -2743,8 +3003,8 @@ bool FasterKv<K, V, D>::Checkpoint(void(*index_persistence_callback)(Status resu
   return true;
 }
 
-template <class K, class V, class D>
-bool FasterKv<K, V, D>::CheckpointIndex(void(*index_persistence_callback)(Status result),
+template <class K, class V, class D, bool isHotColdLog>
+bool FasterKv<K, V, D, isHotColdLog>::CheckpointIndex(void(*index_persistence_callback)(Status result),
                                         Guid& token) {
   // Only one thread can initiate a checkpoint at a time.
   SystemState expected{ Action::None, Phase::REST, system_state_.load().version };
@@ -2767,8 +3027,8 @@ bool FasterKv<K, V, D>::CheckpointIndex(void(*index_persistence_callback)(Status
   return true;
 }
 
-template <class K, class V, class D>
-bool FasterKv<K, V, D>::CheckpointHybridLog(void(*hybrid_log_persistence_callback)(Status result,
+template <class K, class V, class D, bool isHotColdLog>
+bool FasterKv<K, V, D, isHotColdLog>::CheckpointHybridLog(void(*hybrid_log_persistence_callback)(Status result,
     uint64_t persistent_serial_num), Guid& token) {
   // Only one thread can initiate a checkpoint at a time.
   SystemState expected{ Action::None, Phase::REST, system_state_.load().version };
@@ -2796,8 +3056,8 @@ bool FasterKv<K, V, D>::CheckpointHybridLog(void(*hybrid_log_persistence_callbac
   return true;
 }
 
-template <class K, class V, class D>
-Status FasterKv<K, V, D>::Recover(const Guid& index_token, const Guid& hybrid_log_token,
+template <class K, class V, class D, bool isHotColdLog>
+Status FasterKv<K, V, D, isHotColdLog>::Recover(const Guid& index_token, const Guid& hybrid_log_token,
                                   uint32_t& version,
                                   std::vector<Guid>& session_ids) {
   version = 0;
@@ -2851,8 +3111,8 @@ Status FasterKv<K, V, D>::Recover(const Guid& index_token, const Guid& hybrid_lo
 #undef BREAK_NOT_OK
 }
 
-template <class K, class V, class D>
-bool FasterKv<K, V, D>::ShiftBeginAddress(Address address,
+template <class K, class V, class D, bool isHotColdLog>
+bool FasterKv<K, V, D, isHotColdLog>::ShiftBeginAddress(Address address,
     GcState::truncate_callback_t truncate_callback,
     GcState::complete_callback_t complete_callback) {
   SystemState expected = SystemState{ Action::None, Phase::REST, system_state_.load().version };
@@ -2872,8 +3132,8 @@ bool FasterKv<K, V, D>::ShiftBeginAddress(Address address,
   return true;
 }
 
-template <class K, class V, class D>
-bool FasterKv<K, V, D>::GrowIndex(GrowState::callback_t caller_callback) {
+template <class K, class V, class D, bool isHotColdLog>
+bool FasterKv<K, V, D, isHotColdLog>::GrowIndex(GrowState::callback_t caller_callback) {
   SystemState expected = SystemState{ Action::None, Phase::REST, system_state_.load().version };
   if(!system_state_.compare_exchange_strong(expected,
       SystemState{ Action::GrowIndex, Phase::REST, expected.version })) {
@@ -2914,8 +3174,8 @@ inline std::ostream& operator << (std::ostream& out, const FixedPageAddress addr
 
 /// When invoked, compacts the hybrid-log between the begin address and a
 /// passed in offset (`untilAddress`).
-template <class K, class V, class D>
-bool FasterKv<K, V, D>::Compact(uint64_t untilAddress)
+template <class K, class V, class D, bool isHotColdLog>
+bool FasterKv<K, V, D, isHotColdLog>::Compact(uint64_t untilAddress)
 {
   // First, initialize a mini FASTER that will store all live records in
   // the range [beginAddress, untilAddress).
@@ -3004,6 +3264,175 @@ bool FasterKv<K, V, D>::Compact(uint64_t untilAddress)
   return true;
 }
 
+class SimpleArenaAllocator
+{
+public:
+  SimpleArenaAllocator() {
+    Reset();
+  }
+
+  ~SimpleArenaAllocator() {
+    for (uint8_t* ptr : allBuffer_)
+    {
+      delete [] ptr;
+    }
+    for (uint8_t* ptr : largeBuffer_)
+    {
+      delete [] ptr;
+    }
+  }
+
+  void Reset() {
+    if (allBuffer_.size() == 0) {
+      allBuffer_.push_back(new uint8_t[x_blockSize]);
+    }
+    curBuffer_ = 0;
+    curPtr_ = allBuffer_[0];
+    for (uint8_t* ptr : largeBuffer_)
+    {
+      delete [] ptr;
+    }
+    largeBuffer_.clear();
+  }
+
+  uint8_t* Allocate(size_t requestSize) {
+    requestSize = (requestSize + 7) / 8 * 8;
+    if (requestSize == 0) { requestSize = 8; }
+    if (requestSize > x_blockSize) {
+      largeBuffer_.push_back(new uint8_t[requestSize]);
+      return largeBuffer_.back();
+    }
+    assert(curBuffer_ < allBuffer_.size());
+    if (curPtr_ + requestSize > allBuffer_[curBuffer_] + x_blockSize) {
+      if (curBuffer_ == allBuffer_.size() - 1) {
+        allBuffer_.push_back(new uint8_t[x_blockSize]);
+      }
+      curBuffer_++;
+      curPtr_ = allBuffer_[curBuffer_];
+    }
+    uint8_t* result = curPtr_;
+    curPtr_ += requestSize;
+    return result;
+  }
+
+private:
+  static const size_t x_blockSize = 131072;
+  std::vector<uint8_t*> allBuffer_;
+  std::vector<uint8_t*> largeBuffer_;
+  size_t curBuffer_;
+  uint8_t* curPtr_;
+};
+
+template <class K, class V, class D, bool isHotColdLog>
+void FasterKv<K, V, D, isHotColdLog>::BatchInsertIntoColdLog(const std::vector<Record<K,V>*>& list)
+{
+  for (record_t* record : list) {
+    if (record == nullptr) {
+      // this is an invalidated record.
+      continue;
+    }
+    if (record->header.tombstone) {
+      // we need to delete the record in cold log, if it exists
+      // if it does not exist, do nothing
+      HotColdLogCompactionDeleteContext<K, V> ctxt(const_cast<K*>(&record->key()), record->value().size());
+      auto cb = [](IAsyncContext* c, Status r) {};
+      // TODO: figure out the correct serial_num
+      cold_faster_->Delete(ctxt, cb, 1);
+    } else {
+      // we need to insert the record into cold log
+      HotColdLogCompactionUpsertContext<K, V> ctxt(const_cast<K*>(&record->key()), const_cast<V*>(&record->value()));
+      auto cb = [](IAsyncContext* c, Status r) {};
+      // TODO: figure out the correct serial_num
+      cold_faster_->Upsert(ctxt, cb, 1);
+    }
+  }
+  cold_faster_->CompletePending(true);
+}
+
+template <class K, class V, class D, bool isHotColdLog>
+void FasterKv<K, V, D, isHotColdLog>::CompactHotLog(GcState::complete_callback_t complete_callback)
+{
+  assert(isHotColdLog);
+  Address begin = hlog.begin_address.load();
+  Address end = hlog.safe_read_only_address.load();
+  ScanIterator<faster_t> iter(&hlog, Buffering::DOUBLE_PAGE, begin, end, &disk);
+
+  struct KeyHashHelper {
+    using KeyType = K*;
+      size_t operator()(const KeyType& k) const noexcept {
+          return k->GetHash().GetControl();
+      }
+  };
+
+  struct KeyEqualHelper {
+      using KeyType = K*;
+      bool operator()(const KeyType& k1, const KeyType& k2) const noexcept {
+          if (k1 == k2) {
+            return true;
+          }
+          return (*k1) == (*k2);
+      }
+  };
+
+  const static size_t x_packSize = 1000;
+  SimpleArenaAllocator alloc;
+  std::vector<record_t*> list;
+  list.reserve(x_packSize);
+  std::unordered_map<K*, size_t, KeyHashHelper, KeyEqualHelper> exist;
+
+  while (true) {
+    const record_t* r = iter.GetNext();
+    if (r == nullptr) break;
+
+    if (r->header.IsNull()) {
+      continue;
+    }
+    if (r->header.invalid) {
+      continue;
+    }
+
+    // ContainsKeyInMemory is purely an optimization:
+    // it is always safe and correct to write the record into cold log,
+    // only that it is a waste if the record is no longer the most recent version.
+    // So we don't need to worry about race conditions about keys being updated concurrently,
+    // or if the key exists on disk but not in memory.
+    if (!ContainsKeyInMemory(r->key(), end))
+    {
+      record_t* buffer = reinterpret_cast<record_t*>(alloc.Allocate(r->size()));
+      memcpy(buffer, r, r->size());
+      list.push_back(buffer);
+      key_t* key = const_cast<key_t*>(&(buffer->key()));
+      if (exist.count(key)) {
+        // The key already showed up in this batch.
+        // We need to invalidate the prior record: each batch is inserted into cold log out-of-order
+        // due to the asynchrounous nature, we must invalidate the prior record to make sure this
+        // record actually overwrites the prior one.
+        auto it = exist.find(key);
+        assert(it != exist.end() && it->second < list.size() - 1);
+        assert(list[it->second] != nullptr);
+        list[it->second] = nullptr;
+        it->second = list.size() - 1;
+      } else {
+        exist[key] = list.size() - 1;
+      }
+      if (list.size() == x_packSize) {
+        BatchInsertIntoColdLog(list);
+        list.clear();
+        exist.clear();
+        alloc.Reset();
+      }
+    }
+  }
+  if (list.size() > 0)
+  {
+    BatchInsertIntoColdLog(list);
+  }
+
+  auto truncate_callback = [](uint64_t offset) {};
+  bool success = ShiftBeginAddress(end, truncate_callback, complete_callback);
+  assert(success);  // TODO: what happens if it fails?
+}
+
 /// Scans the hybrid log starting at `from` until the safe-read-only address,
 /// deleting all encountered records from within a passed in temporary FASTER
 /// instance.
@@ -3014,8 +3443,8 @@ bool FasterKv<K, V, D>::Compact(uint64_t untilAddress)
 /// in the safe-read-only region of the main FASTER instance.
 ///
 /// Returns the address upto which the scan was performed.
-template <class K, class V, class D>
-Address FasterKv<K, V, D>::LogScanForValidity(Address from, faster_t* temp)
+template <class K, class V, class D, bool isHotColdLog>
+Address FasterKv<K, V, D, isHotColdLog>::LogScanForValidity(Address from, faster_t* temp)
 {
   // Scan upto the safe read only region of the log, deleting all encountered
   // records from the temporary instance of FASTER. Since the safe-read-only
@@ -3055,8 +3484,8 @@ Address FasterKv<K, V, D>::LogScanForValidity(Address from, faster_t* temp)
 
 /// Checks if a key exists between a passed in address (`offset`) and the
 /// current tail of the hybrid log.
-template <class K, class V, class D>
-bool FasterKv<K, V, D>::ContainsKeyInMemory(key_t key, Address offset)
+template <class K, class V, class D, bool isHotColdLog>
+bool FasterKv<K, V, D, isHotColdLog>::ContainsKeyInMemory(const key_t& key, Address offset)
 {
   // First, retrieve the hash table entry corresponding to this key.
   KeyHash hash = key.GetHash();

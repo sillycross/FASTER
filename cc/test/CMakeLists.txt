@@ -1,4 +1,5 @@
 ADD_FASTER_TEST(in_memory_test "")
+ADD_FASTER_TEST(hot_cold_log_test "")
 ADD_FASTER_TEST(malloc_fixed_page_size_test "")
 ADD_FASTER_TEST(paging_queue_test "paging_test.h")
 if(MSVC)

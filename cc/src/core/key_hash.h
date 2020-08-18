@@ -26,6 +26,8 @@ struct KeyHash {
     return *this;
   }
 
+  uint64_t GetControl() const { return control_; }
+
   /// Truncate the key hash's address to get the page_index into a hash table of specified size.
   inline uint64_t idx(uint64_t size) const {
     assert(Utility::IsPowerOfTwo(size));
