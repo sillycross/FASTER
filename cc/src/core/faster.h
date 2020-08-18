@@ -625,6 +625,12 @@ inline Status FasterKv<K, V, D, isHotColdLog>::Read(RC& context, AsyncCallback c
     assert(internal_status == OperationStatus::RECORD_ON_DISK);
     bool async;
     status = HandleOperationStatus(thread_ctx(), pending_context, internal_status, async);
+    if (status == Status::NotFound && isHotColdLog) {
+      status = cold_faster_->Read(context, callback, monotonic_serial_num);
+    } else if (status == Status::NotFoundHotLogTombstone) {
+      assert(isHotColdLog);
+      status = Status::NotFound;
+    }
   }
   thread_ctx().serial_num = monotonic_serial_num;
   return status;
