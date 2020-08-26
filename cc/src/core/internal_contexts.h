@@ -45,7 +45,8 @@ enum class OperationStatus : uint8_t {
   SUCCESS_UNMARK,
   NOT_FOUND_UNMARK,
   NOT_FOUND_UNMARK_HOTLOG_TOMBSTONE,
-  CPR_SHIFT_DETECTED
+  CPR_SHIFT_DETECTED,
+  COLD_LOG_QUERY_ISSUED
 };
 
 /// Internal FASTER context.
@@ -239,9 +240,9 @@ class PendingReadContext : public AsyncPendingReadContext<typename RC::key_t> {
 
 /// Helper class for WrappedAsyncPendingReadContext
 template <class K>
-class WrappedAsyncPendingReadContextShallowKey {
+class WrappedAsyncPendingContextShallowKey {
 public:
-  WrappedAsyncPendingReadContextShallowKey(AsyncPendingReadContext<K>* ctxt)
+  WrappedAsyncPendingContextShallowKey(PendingContext<K>* ctxt)
     : ctxt_(ctxt) {
   }
   inline uint32_t size() const {
@@ -260,7 +261,7 @@ public:
   inline bool operator!=(const K& other) const {
     return !(*this == other);
   }
-  AsyncPendingReadContext<K>* ctxt_;
+  PendingContext<K>* ctxt_;
 };
 
 /// A wrapper of AsyncPendingReadContext, that allows it to be passed to Read again
@@ -269,7 +270,7 @@ class WrappedAsyncPendingReadContext : public IAsyncContext {
  public:
   typedef K key_t;
   typedef V value_t;
-  using shallow_key_t = WrappedAsyncPendingReadContextShallowKey<K>;
+  using shallow_key_t = WrappedAsyncPendingContextShallowKey<K>;
 
   WrappedAsyncPendingReadContext(AsyncPendingReadContext<K>* ctxt)
     : ctxt_(ctxt)
@@ -394,14 +395,18 @@ class AsyncPendingRmwContext : public PendingContext<K> {
  public:
   /// Set initial value.
   virtual void RmwInitial(void* rec) = 0;
+  virtual void RmwInitialV(void* value) = 0;
   /// RCU.
   virtual void RmwCopy(const void* old_rec, void* rec) = 0;
+  virtual void RmwCopyV(const void* old_value, void* value) = 0;
   /// in-place update.
   virtual bool RmwAtomic(void* rec) = 0;
+  virtual bool RmwAtomicV(void* value) = 0;
   /// Get value size for initial value or in-place update
   virtual uint32_t value_size() const = 0;
   /// Get value size for RCU
   virtual uint32_t value_size(const void* old_rec) const = 0;
+  virtual uint32_t value_size_v(const void* old_value) const = 0;
 };
 
 /// A synchronous Rmw() context preserves its type information.
@@ -467,6 +472,17 @@ class PendingRmwContext : public AsyncPendingRmwContext<typename MC::key_t> {
     record_t* record = reinterpret_cast<record_t*>(rec);
     return rmw_context().RmwAtomic(record->value());
   }
+  inline void RmwInitialV(void* value) final {
+    rmw_context().RmwInitial(*reinterpret_cast<value_t*>(value));
+  }
+  /// RCU.
+  inline void RmwCopyV(const void* old_value, void* value) final {
+    rmw_context().RmwCopy(*reinterpret_cast<const value_t*>(old_value), *reinterpret_cast<value_t*>(value));
+  }
+  /// in-place update.
+  inline bool RmwAtomicV(void* value) final {
+    return rmw_context().RmwAtomic(*reinterpret_cast<value_t*>(value));
+  }
   /// Get value size for initial value or in-place update
   inline constexpr uint32_t value_size() const final {
     return rmw_context().value_size();
@@ -476,6 +492,53 @@ class PendingRmwContext : public AsyncPendingRmwContext<typename MC::key_t> {
     const record_t* old_record = reinterpret_cast<const record_t*>(old_rec);
     return rmw_context().value_size(old_record->value());
   }
+  inline constexpr uint32_t value_size_v(const void* old_value) const final {
+    const value_t* val = reinterpret_cast<const value_t*>(old_value);
+    return rmw_context().value_size(*val);
+  }
+};
+
+template <class K, class V>
+class WrappedAsyncPendingReadContextForRmw : public IAsyncContext {
+ public:
+  typedef K key_t;
+  typedef V value_t;
+  using shallow_key_t = WrappedAsyncPendingContextShallowKey<K>;
+
+  WrappedAsyncPendingReadContextForRmw(
+      AsyncPendingRmwContext<K>* ctxt,
+      const std::function<void(WrappedAsyncPendingReadContextForRmw<K, V>*, const value_t*)>& callback)
+    : ctxt_(ctxt)
+    , shallow_key_(ctxt)
+    , rmw_callback_(callback)
+    , isDone(false) {
+  }
+  /// The deep copy constructor.
+  WrappedAsyncPendingReadContextForRmw(WrappedAsyncPendingReadContextForRmw& other)
+    : ctxt_(other.ctxt_), shallow_key_(other.shallow_key_), rmw_callback_(other.rmw_callback_), isDone(other.isDone) {
+  }
+ protected:
+  /// The explicit interface requires a DeepCopy_Internal() implementation.
+  Status DeepCopy_Internal(IAsyncContext*& context_copy) {
+    return IAsyncContext::DeepCopy_Internal(*this, context_copy);
+  }
+ public:
+  const shallow_key_t& key() const { return shallow_key_; }
+  void Get(const value_t& value)
+  {
+    rmw_callback_(this, &value);
+  }
+  void GetAtomic(const value_t& value)
+  {
+    // TODO: fix
+    rmw_callback_(this, &value);
+  }
+
+  // TODO: figure out when this should be freed
+  AsyncPendingRmwContext<K>* ctxt_;
+  shallow_key_t shallow_key_;
+  std::function<void(WrappedAsyncPendingReadContextForRmw<K, V>*, const value_t*)> rmw_callback_;
+  bool isDone;
 };
 
 /// FASTER's internal Delete() context.
@@ -549,6 +612,36 @@ class PendingDeleteContext : public AsyncPendingDeleteContext<typename MC::key_t
   inline uint32_t value_size() const final {
     return delete_context().value_size();
   }
+};
+
+template <class K, class V>
+class WrappedAsyncPendingDeleteContext : public IAsyncContext {
+ public:
+  typedef K key_t;
+  typedef V value_t;
+  using shallow_key_t = WrappedAsyncPendingContextShallowKey<K>;
+
+  WrappedAsyncPendingDeleteContext(
+      AsyncPendingDeleteContext<K>* ctxt)
+    : ctxt_(ctxt)
+    , shallow_key_(ctxt) {
+  }
+  /// The deep copy constructor.
+  WrappedAsyncPendingDeleteContext(WrappedAsyncPendingDeleteContext& other)
+    : ctxt_(other.ctxt_), shallow_key_(other.shallow_key_) {
+  }
+ protected:
+  /// The explicit interface requires a DeepCopy_Internal() implementation.
+  Status DeepCopy_Internal(IAsyncContext*& context_copy) {
+    return IAsyncContext::DeepCopy_Internal(*this, context_copy);
+  }
+ public:
+  const shallow_key_t& key() const { return shallow_key_; }
+  uint32_t value_size() const { return ctxt_->value_size(); }
+
+  // TODO: figure out when this should be freed
+  AsyncPendingDeleteContext<K>* ctxt_;
+  shallow_key_t shallow_key_;
 };
 
 class AsyncIOContext;

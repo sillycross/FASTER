@@ -200,6 +200,16 @@ class FasterKv {
       AsyncIOContext& io_context);
   OperationStatus InternalContinuePendingRmw(ExecutionContext& ctx,
       AsyncIOContext& io_context);
+  bool RmwIssueColdLogQuery(
+      ExecutionContext& context,
+      async_pending_rmw_context_t* pending_context);
+  OperationStatus InternalContinuePendingRmwInternal(
+      ExecutionContext& context,
+      async_pending_rmw_context_t* pending_context,
+      bool fromIoContext,
+      Address ioContextAddress,
+      const record_t* disk_record,
+      const value_t* disk_value);
 
   // Find the hash bucket entry, if any, corresponding to the specified hash.
   // The caller can use the "expected_entry" to CAS its desired address into the entry.
@@ -677,6 +687,8 @@ inline Status FasterKv<K, V, D, isHotColdLog>::Rmw(MC& context, AsyncCallback ca
   Status status;
   if(internal_status == OperationStatus::SUCCESS) {
     status = Status::Ok;
+  } else if (internal_status == OperationStatus::COLD_LOG_QUERY_ISSUED) {
+    status = Status::Pending;
   } else {
     bool async;
     status = HandleOperationStatus(thread_ctx(), pending_context, internal_status, async);
@@ -763,27 +775,41 @@ inline void FasterKv<K, V, D, isHotColdLog>::CompleteIoPendingRequests(Execution
     if(internal_status == OperationStatus::SUCCESS) {
       result = Status::Ok;
     } else if(internal_status == OperationStatus::NOT_FOUND) {
-      if (isHotColdLog) {
-        WrappedAsyncPendingReadContext<K, V> wctxt(static_cast<async_pending_read_context_t*>(pending_context.get()));
-        result = cold_faster_->Read(wctxt, pending_context->caller_callback, thread_ctx().serial_num);
-        assert(result == Status::Ok || result == Status::NotFound || result == Status::Pending);
-        pending_context.async = (result == Status::Pending);
+      if(pending_context->type == OperationType::Read) {
+        if (isHotColdLog) {
+          WrappedAsyncPendingReadContext<K, V> wctxt(static_cast<async_pending_read_context_t*>(pending_context.get()));
+          result = cold_faster_->Read(wctxt, pending_context->caller_callback, thread_ctx().serial_num);
+          assert(result == Status::Ok || result == Status::NotFound || result == Status::Pending);
+          pending_context.async = (result == Status::Pending);
+        } else {
+          result = Status::NotFound;
+        }
       } else {
+        assert(pending_context->type != OperationType::RMW);
         result = Status::NotFound;
       }
     } else if(internal_status == OperationStatus::NOT_FOUND_HOTLOG_TOMBSTONE) {
       result = Status::NotFound;
+    } else if(internal_status == OperationStatus::COLD_LOG_QUERY_ISSUED) {
+      // The cold log is now responsible for completing the operation. We don't need to do anything more.
+      //
+      result = Status::Pending;
+      pending_context.async = true;
     } else {
       result = HandleOperationStatus(context, *pending_context.get(), internal_status,
                                      pending_context.async);
-      if (internal_status == OperationStatus::NOT_FOUND_UNMARK && isHotColdLog) {
-        assert(!pending_context.async);
-        WrappedAsyncPendingReadContext<K, V> wctxt(static_cast<async_pending_read_context_t*>(pending_context.get()));
-        result = cold_faster_->Read(wctxt, pending_context->caller_callback, thread_ctx().serial_num);
-        assert(result == Status::Ok || result == Status::NotFound || result == Status::Pending);
-        pending_context.async = (result == Status::Pending);
-      } else if (internal_status == OperationStatus::NOT_FOUND_UNMARK_HOTLOG_TOMBSTONE) {
-        assert(isHotColdLog && result == Status::NotFound);
+      if(pending_context->type == OperationType::Read) {
+        if (internal_status == OperationStatus::NOT_FOUND_UNMARK && isHotColdLog) {
+          assert(!pending_context.async);
+          WrappedAsyncPendingReadContext<K, V> wctxt(static_cast<async_pending_read_context_t*>(pending_context.get()));
+          result = cold_faster_->Read(wctxt, pending_context->caller_callback, thread_ctx().serial_num);
+          assert(result == Status::Ok || result == Status::NotFound || result == Status::Pending);
+          pending_context.async = (result == Status::Pending);
+        } else if (internal_status == OperationStatus::NOT_FOUND_UNMARK_HOTLOG_TOMBSTONE) {
+          assert(isHotColdLog && result == Status::NotFound);
+        }
+      } else {
+        // TODO: handle other operations
       }
     }
     if(!pending_context.async) {
@@ -1209,11 +1235,30 @@ inline OperationStatus FasterKv<K, V, D, isHotColdLog>::InternalRmw(C& pending_c
 
   // Create a record and attempt RCU.
 create_record:
+  bool shouldCheckColdLog = isHotColdLog;
   const record_t* old_record = nullptr;
   if(address >= head_address) {
     old_record = reinterpret_cast<const record_t*>(hlog.Get(address));
     if(old_record->header.tombstone) {
       old_record = nullptr;
+    }
+    // no matter if old_record is a tombstone, or old_record is not a tombstone but RmwAtomic() failed,
+    // we should not check cold log, because the record (or its tombstone) exists in hot log
+    //
+    shouldCheckColdLog = false;
+  }
+  if (shouldCheckColdLog)
+  {
+    // TODO: handle case that cold log directly returned
+    async_pending_rmw_context_t* ctxt = &pending_context;
+    IAsyncContext* copy_;
+    ctxt->DeepCopy(copy_);
+    async_pending_rmw_context_t* copy = static_cast<async_pending_rmw_context_t*>(copy_);
+    bool isDone = RmwIssueColdLogQuery(thread_ctx(), copy);
+    if (isDone) {
+      return OperationStatus::SUCCESS;
+    } else {
+      return OperationStatus::COLD_LOG_QUERY_ISSUED;
     }
   }
   uint32_t record_size = old_record != nullptr ?
@@ -1292,9 +1337,23 @@ inline OperationStatus FasterKv<K, V, D, isHotColdLog>::InternalDelete(C& pendin
   KeyHash hash = pending_context.get_key_hash();
   HashBucketEntry expected_entry;
   AtomicHashBucketEntry* atomic_entry = const_cast<AtomicHashBucketEntry*>(FindEntry(hash, expected_entry));
+
   if(!atomic_entry) {
     // no record found
-    return OperationStatus::NOT_FOUND;
+    if (isHotColdLog) {
+      WrappedAsyncPendingDeleteContext<K, V> ctxt(&pending_context);
+      Status r = cold_faster_->Delete(ctxt, pending_context.caller_callback, thread_ctx().serial_num);
+      assert(r == Status::Pending || r == Status::NotFound || r == Status::Ok);
+      if (r == Status::Pending) {
+        return OperationStatus::COLD_LOG_QUERY_ISSUED;
+      } else if (r == Status::NotFound) {
+        return OperationStatus::NOT_FOUND;
+      } else {
+        return OperationStatus::SUCCESS;
+      }
+    } else {
+      return OperationStatus::NOT_FOUND;
+    }
   }
 
   Address address = expected_entry.address();
@@ -1369,14 +1428,17 @@ inline OperationStatus FasterKv<K, V, D, isHotColdLog>::InternalDelete(C& pendin
     record_t* record = reinterpret_cast<record_t*>(hlog.Get(address));
     // If the record is the head of the hash chain, try to update the hash chain and completely
     // elide record only if the previous address points to invalid address
-    /*
-    if(expected_entry.address() == address) {
-      Address previous_address = record->header.previous_address();
-      if (previous_address < begin_address) {
-        atomic_entry->compare_exchange_strong(expected_entry, HashBucketEntry::kInvalidEntry);
+    // We can only do this when we don't have hot-cold-log separation:
+    // in hot-cold-log, the tombstone indicates that the key is invalid in cold log even if it exists,
+    // so we must not delete it.
+    if (!isHotColdLog) {
+      if(expected_entry.address() == address) {
+        Address previous_address = record->header.previous_address();
+        if (previous_address < begin_address) {
+          atomic_entry->compare_exchange_strong(expected_entry, HashBucketEntry::kInvalidEntry);
+        }
       }
     }
-    */
     record->header.tombstone = true;
     return OperationStatus::SUCCESS;
   }
@@ -1504,6 +1566,9 @@ inline Status FasterKv<K, V, D, isHotColdLog>::HandleOperationStatus(ExecutionCo
     return Status::NotFound;
   case OperationStatus::CPR_SHIFT_DETECTED:
     return PivotAndRetry(ctx, pending_context, async);
+  case OperationStatus::COLD_LOG_QUERY_ISSUED:
+    async = true;
+    return Status::Pending;
   }
   // not reached
   assert(false);
@@ -1672,11 +1737,69 @@ OperationStatus FasterKv<K, V, D, isHotColdLog>::InternalContinuePendingRead(Exe
 }
 
 template <class K, class V, class D, bool isHotColdLog>
-OperationStatus FasterKv<K, V, D, isHotColdLog>::InternalContinuePendingRmw(ExecutionContext& context,
-    AsyncIOContext& io_context) {
-  async_pending_rmw_context_t* pending_context = static_cast<async_pending_rmw_context_t*>(
-        io_context.caller_context);
+bool FasterKv<K, V, D, isHotColdLog>::RmwIssueColdLogQuery(
+    ExecutionContext& context,
+    async_pending_rmw_context_t* pending_context)
+{
+  // TODO: fix 'context'
+  auto wrapped_user_cb = [](IAsyncContext* ctxt_, Status result) {
+    if (result == Status::NotFound)
+    {
+      WrappedAsyncPendingReadContextForRmw<K, V>* ctxt = static_cast<WrappedAsyncPendingReadContextForRmw<K, V>*>(ctxt_);
+      ctxt->rmw_callback_(ctxt, nullptr);
+    }
+  };
+  ExecutionContext* ecPtr = &context;
+  std::function<void(WrappedAsyncPendingReadContextForRmw<K, V>*, const value_t*)> cb = [this, ecPtr, wrapped_user_cb, &cb]
+      (WrappedAsyncPendingReadContextForRmw<K, V>* ctxt, const value_t* value)
+  {
+    OperationStatus status = InternalContinuePendingRmwInternal(*ecPtr, ctxt->ctxt_, false /*fromIoContext*/,
+                                       Address(), nullptr /*disk_record*/, value);
+    assert(status == OperationStatus::SUCCESS || status == OperationStatus::SUCCESS_UNMARK ||
+           status == OperationStatus::RETRY_NOW);
+    if (status == OperationStatus::SUCCESS_UNMARK || status == OperationStatus::SUCCESS)
+    {
+      if (status == OperationStatus::SUCCESS_UNMARK)
+      {
+        checkpoint_locks_.get_lock(ctxt->ctxt_->get_key_hash()).unlock_old();
+      }
+      if (ctxt->from_deep_copy()) {
+        ctxt->ctxt_->caller_callback(ctxt->ctxt_, Status::Ok);
+      }
+      ctxt->isDone = true;
+    }
+    else if (status == OperationStatus::RETRY_NOW)
+    {
+      Status result = cold_faster_->Read(*ctxt, wrapped_user_cb, ecPtr->serial_num);
+      assert(result == Status::Ok || result == Status::NotFound || result == Status::Pending);
+      if (result == Status::NotFound)
+      {
+        wrapped_user_cb(ctxt, result);
+      }
+    }
+  };
+  WrappedAsyncPendingReadContextForRmw<K, V> readCtxt(pending_context, cb);
+  Status result = cold_faster_->Read(readCtxt, wrapped_user_cb, ecPtr->serial_num);
+  assert(result == Status::Ok || result == Status::NotFound || result == Status::Pending);
+  if (result == Status::NotFound)
+  {
+    wrapped_user_cb(&readCtxt, result);
+  }
+  return readCtxt.isDone;
+}
 
+template <class K, class V, class D, bool isHotColdLog>
+OperationStatus FasterKv<K, V, D, isHotColdLog>::InternalContinuePendingRmwInternal(
+    ExecutionContext& context,
+    async_pending_rmw_context_t* pending_context,
+    bool fromIoContext,
+    // If fromIoContext is true, the address of the record
+    Address ioContextAddress,
+    // If fromIoContext is true, the record
+    const record_t* disk_record,
+    // If not fromIoContext, the value
+    const value_t* disk_value)
+{
   // Find a hash bucket entry to store the updated value in.
   KeyHash hash = pending_context->get_key_hash();
   HashBucketEntry expected_entry;
@@ -1704,8 +1827,18 @@ OperationStatus FasterKv<K, V, D, isHotColdLog>::InternalContinuePendingRmw(Exec
   // We have to do copy-on-write/RCU and write the updated value to the tail of the log.
   Address new_address;
   record_t* new_record;
-  if(io_context.address < hlog.begin_address.load()) {
+  if((fromIoContext && ioContextAddress < hlog.begin_address.load()) ||
+     (!fromIoContext && disk_value == nullptr)) {
     // The on-disk trace back failed to find a key match.
+    if (isHotColdLog && fromIoContext) {
+      // continue searching on the cold log
+      bool isDone = RmwIssueColdLogQuery(context, pending_context);
+      if (!isDone) {
+        return OperationStatus::COLD_LOG_QUERY_ISSUED;
+      } else {
+        return OperationStatus::SUCCESS;
+      }
+    }
     uint32_t record_size = record_t::size(pending_context->key_size(), pending_context->value_size());
     new_address = BlockAllocate(record_size);
     new_record = reinterpret_cast<record_t*>(hlog.Get(new_address));
@@ -1718,10 +1851,17 @@ OperationStatus FasterKv<K, V, D, isHotColdLog>::InternalContinuePendingRmw(Exec
     pending_context->write_deep_key_at(const_cast<key_t*>(&new_record->key()));
     pending_context->RmwInitial(new_record);
   } else {
-    // The record we read from disk.
-    const record_t* disk_record = reinterpret_cast<const record_t*>(
-                                    io_context.record.GetValidPointer());
-    uint32_t record_size = record_t::size(pending_context->key_size(), pending_context->value_size(disk_record));
+    uint32_t record_size;
+    if (fromIoContext) {
+      if (!disk_record->header.tombstone) {
+        record_size = record_t::size(pending_context->key_size(), pending_context->value_size(disk_record));
+      } else {
+        record_size = record_t::size(pending_context->key_size(), pending_context->value_size());
+      }
+    } else {
+        record_size = record_t::size(pending_context->key_size(), pending_context->value_size_v(disk_value));
+    }
+
     new_address = BlockAllocate(record_size);
     new_record = reinterpret_cast<record_t*>(hlog.Get(new_address));
 
@@ -1731,7 +1871,18 @@ OperationStatus FasterKv<K, V, D, isHotColdLog>::InternalContinuePendingRmw(Exec
         expected_entry.address() },
     };
     pending_context->write_deep_key_at(const_cast<key_t*>(&new_record->key()));
-    pending_context->RmwCopy(disk_record, new_record);
+    if (fromIoContext && !disk_record->header.tombstone)
+    {
+      pending_context->RmwCopy(disk_record, new_record);
+    }
+    else if (!fromIoContext)
+    {
+      pending_context->RmwCopyV(disk_value, &new_record->value());
+    }
+    else
+    {
+      pending_context->RmwInitial(new_record);
+    }
   }
 
   HashBucketEntry updated_entry{ new_address, hash.tag(), false };
@@ -1745,6 +1896,18 @@ OperationStatus FasterKv<K, V, D, isHotColdLog>::InternalContinuePendingRmw(Exec
     pending_context->continue_async(address, expected_entry);
     return OperationStatus::RETRY_NOW;
   }
+}
+
+template <class K, class V, class D, bool isHotColdLog>
+OperationStatus FasterKv<K, V, D, isHotColdLog>::InternalContinuePendingRmw(
+    ExecutionContext& context, AsyncIOContext& io_context)
+{
+  async_pending_rmw_context_t* pending_context = static_cast<async_pending_rmw_context_t*>(
+        io_context.caller_context);
+  const record_t* disk_record = reinterpret_cast<const record_t*>(
+                                  io_context.record.GetValidPointer());
+  return InternalContinuePendingRmwInternal(context, pending_context, true /*fromIoContext*/,
+                                            io_context.address, disk_record, nullptr /*disk_value*/);
 }
 
 template <class K, class V, class D, bool isHotColdLog>
