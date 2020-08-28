@@ -764,6 +764,377 @@ TEST(HotColdLog, OnDiskTest)
   store.StopSession();
 }
 
+TEST(HotColdLog, CompactionTest)
+{
+  using handler_t = FASTER::environment::QueueIoHandler;
+  using disk_t = FASTER::device::FileSystemDisk<handler_t, 1073741824ull>;
+  using store_t = FASTER::core::FasterKv<Key, Value, disk_t, true>;
+
+  store_t store { 1048576, 192 * 1048576ULL, "storage", 0.4 /*mutableFraction*/ };
+
+  store.StartSession();
+
+  const int x_keyLenU64 = 500;
+
+  // Insert.
+  for(uint32_t idx = 0; idx < 200000; ++idx) {
+    auto callback = [](IAsyncContext* ctxt, Status result) {
+        assert(result == Status::Ok);
+    };
+
+    uint64_t* key = new uint64_t[x_keyLenU64];
+    for (size_t j = 0; j < x_keyLenU64; ++j) {
+      key[j] = idx;
+    }
+
+    UpsertContext context{ reinterpret_cast<uint8_t*>(key), x_keyLenU64 * 8 , 42 };
+    Status result = store.Upsert(context, callback, 1);
+    assert(result == Status::Ok || result == Status::Pending);
+    store.CompletePending(true);
+    store.GetColdLog()->CompletePending(true);
+
+    if (idx % 10000 == 0)
+    {
+      printf("inserted %d/%d\n", int(idx), 200000);
+    }
+  }
+  static std::atomic<bool> compactionCompleted(false);
+
+  int pending_cnt = 0;
+  static int cb_call_cnt;
+  cb_call_cnt = 0;
+  for(uint32_t i = 0; i < 10000; ++i) {
+    uint32_t idx = rand() % 200000;
+    uint64_t* key = new uint64_t[x_keyLenU64];
+    for (size_t j = 0; j < x_keyLenU64; ++j) {
+      key[j] = idx;
+    }
+
+    ReadContext context{ reinterpret_cast<uint8_t*>(key), x_keyLenU64 * 8 };
+    context.output = 0;
+
+    auto callback = [](IAsyncContext* ctxt, Status result) {
+      assert(result == Status::Ok);
+      ReadContext* c = static_cast<ReadContext*>(ctxt);
+      assert(c->output == 42);
+      cb_call_cnt++;
+    };
+
+    Status result = store.Read(context, callback, 1);
+    if (result == Status::Ok)
+    {
+      assert(context.output == 42);
+    }
+    else
+    {
+      pending_cnt++;
+      if (result != Status::Pending) {
+        store.Read(context, callback, 1);
+      }
+      assert(result == Status::Pending);
+      store.CompletePending(true);
+      store.GetColdLog()->CompletePending(true);
+    }
+
+    if (i % 1000 == 0)
+    {
+      printf("read %d/%d\n", int(i), 10000);
+    }
+  }
+  printf("read: total %d pending codepath\n", pending_cnt);
+  assert(cb_call_cnt == pending_cnt);
+
+  auto completionCallback = []() {
+    compactionCompleted.store(true);
+  };
+
+  compactionCompleted.store(false);
+  store.CompactHotLog(completionCallback);
+
+  // Read.
+  pending_cnt = 0;
+  cb_call_cnt = 0;
+  for(uint32_t i = 0; i < 10000; ++i) {
+    uint32_t idx = rand() % 200000;
+    uint64_t* key = new uint64_t[x_keyLenU64];
+    for (size_t j = 0; j < x_keyLenU64; ++j) {
+      key[j] = idx;
+    }
+
+    ReadContext context{ reinterpret_cast<uint8_t*>(key), x_keyLenU64 * 8 };
+    context.output = 0;
+
+    auto callback = [](IAsyncContext* ctxt, Status result) {
+      assert(result == Status::Ok);
+      ReadContext* c = static_cast<ReadContext*>(ctxt);
+      assert(c->output == 42);
+      cb_call_cnt++;
+    };
+
+    Status result = store.Read(context, callback, 1);
+    if (result == Status::Ok)
+    {
+      assert(context.output == 42);
+    }
+    else
+    {
+      pending_cnt++;
+      if (result != Status::Pending) {
+        store.Read(context, callback, 1);
+      }
+      assert(result == Status::Pending);
+      store.CompletePending(true);
+      store.GetColdLog()->CompletePending(true);
+    }
+
+    if (i % 1000 == 0)
+    {
+      printf("read %d/%d\n", int(i), 10000);
+    }
+  }
+  printf("read: total %d pending codepath\n", pending_cnt);
+  assert(cb_call_cnt == pending_cnt);
+
+  cb_call_cnt = 0;
+  pending_cnt = 0;
+  for(uint32_t idx = 0; idx < 50000; ++idx) {
+    auto callback = [](IAsyncContext* ctxt, Status result) {
+        assert(result == Status::Ok);
+        cb_call_cnt++;
+    };
+
+    uint64_t* key = new uint64_t[x_keyLenU64];
+    for (size_t j = 0; j < x_keyLenU64; ++j) {
+      key[j] = idx;
+    }
+
+    DeleteContext context{ reinterpret_cast<uint8_t*>(key), x_keyLenU64 * 8 };
+    Status result = store.Delete(context, callback, 1);
+    assert(result == Status::Ok || result == Status::Pending);
+    if (result == Status::Pending)
+    {
+      pending_cnt++;
+    }
+    store.CompletePending(true);
+    store.GetColdLog()->CompletePending(true);
+
+    if (idx % 10000 == 0)
+    {
+      printf("deleted %d/%d\n", int(idx), 50000);
+    }
+  }
+  assert(cb_call_cnt == pending_cnt);
+
+  compactionCompleted.store(false);
+  store.CompactHotLog(completionCallback);
+
+  cb_call_cnt = 0;
+  pending_cnt = 0;
+  for(uint32_t idx = 100000; idx < 150000; ++idx) {
+    auto callback = [](IAsyncContext* ctxt, Status result) {
+        assert(result == Status::Ok);
+        cb_call_cnt++;
+    };
+
+    uint64_t* key = new uint64_t[x_keyLenU64];
+    for (size_t j = 0; j < x_keyLenU64; ++j) {
+      key[j] = idx;
+    }
+
+    DeleteContext context{ reinterpret_cast<uint8_t*>(key), x_keyLenU64 * 8 };
+    Status result = store.Delete(context, callback, 1);
+    assert(result == Status::Ok || result == Status::Pending);
+    if (result == Status::Pending)
+    {
+      pending_cnt++;
+    }
+    store.CompletePending(true);
+    store.GetColdLog()->CompletePending(true);
+
+    if (idx % 10000 == 0)
+    {
+      printf("deleted %d/%d\n", int(idx - 100000), 50000);
+    }
+  }
+  assert(pending_cnt == cb_call_cnt);
+
+  compactionCompleted.store(false);
+  store.CompactHotLog(completionCallback);
+
+  cb_call_cnt = 0;
+  pending_cnt = 0;
+  for(uint32_t idx = 200000; idx < 200100; ++idx) {
+    auto callback = [](IAsyncContext* ctxt, Status result) {
+        assert(result == Status::NotFound);
+        cb_call_cnt++;
+    };
+
+    uint64_t* key = new uint64_t[x_keyLenU64];
+    for (size_t j = 0; j < x_keyLenU64; ++j) {
+      key[j] = idx;
+    }
+
+    DeleteContext context{ reinterpret_cast<uint8_t*>(key), x_keyLenU64 * 8 };
+    Status result = store.Delete(context, callback, 1);
+    assert(result == Status::NotFound || result == Status::Pending);
+    if (result == Status::Pending)
+    {
+      pending_cnt++;
+    }
+    store.CompletePending(true);
+    store.GetColdLog()->CompletePending(true);
+  }
+  assert(pending_cnt == cb_call_cnt);
+
+  compactionCompleted.store(false);
+  store.CompactHotLog(completionCallback);
+
+  pending_cnt = 0;
+  cb_call_cnt = 0;
+  for(uint32_t i = 0; i < 10000; ++i) {
+    uint32_t idx = rand() % 200000;
+    uint64_t* key = new uint64_t[x_keyLenU64];
+    for (size_t j = 0; j < x_keyLenU64; ++j) {
+      key[j] = idx;
+    }
+
+    ReadContext context{ reinterpret_cast<uint8_t*>(key), x_keyLenU64 * 8 };
+    context.output = 0;
+
+    static uint32_t queriedIdx;
+    queriedIdx = idx;
+    auto callback = [](IAsyncContext* ctxt, Status result) {
+      if (queriedIdx < 50000 || (100000 <= queriedIdx && queriedIdx < 150000))
+      {
+        assert(result == Status::NotFound);
+      }
+      else
+      {
+        assert(result == Status::Ok);
+        ReadContext* c = static_cast<ReadContext*>(ctxt);
+        assert(c->output == 42);
+      }
+      cb_call_cnt++;
+    };
+
+    Status result = store.Read(context, callback, 1);
+    if (result == Status::Ok || result == Status::NotFound)
+    {
+      if (idx < 50000 || (100000 <= idx && idx < 150000))
+      {
+        assert(result == Status::NotFound);
+      }
+      else
+      {
+        assert(result == Status::Ok);
+        assert(context.output == 42);
+      }
+    }
+    else
+    {
+      pending_cnt++;
+      assert(result == Status::Pending);
+      store.CompletePending(true);
+      store.GetColdLog()->CompletePending(true);
+    }
+
+    if (i % 1000 == 0)
+    {
+      printf("read %d/%d\n", int(i), 10000);
+    }
+  }
+  printf("read: total %d pending codepath\n", pending_cnt);
+  assert(cb_call_cnt == pending_cnt);
+
+  pending_cnt = 0;
+  cb_call_cnt = 0;
+  for(uint32_t idx = 0; idx < 200000; ++idx) {
+    uint64_t* key = new uint64_t[x_keyLenU64];
+    for (size_t j = 0; j < x_keyLenU64; ++j) {
+      key[j] = idx;
+    }
+
+    RmwContext context{ reinterpret_cast<uint8_t*>(key), x_keyLenU64 * 8 };
+
+    auto callback = [](IAsyncContext* ctxt, Status result) {
+      ASSERT_EQ(Status::Ok, result);
+      cb_call_cnt++;
+    };
+
+    Status result = store.Rmw(context, callback, 1);
+    if (result == Status::Pending)
+    {
+      pending_cnt++;
+    }
+    store.CompletePending(true);
+    store.GetColdLog()->CompletePending(true);
+
+    if (idx % 10000 == 0)
+    {
+      printf("rmw %d/%d\n", int(idx), 200000);
+    }
+  }
+  printf("rmw: total %d pending codepath\n", pending_cnt);
+  assert(cb_call_cnt == pending_cnt);
+
+  compactionCompleted.store(false);
+  store.CompactHotLog(completionCallback);
+
+  pending_cnt = 0;
+  cb_call_cnt = 0;
+  for(uint32_t i = 0; i < 10000; ++i) {
+    uint32_t idx = rand() % 200000;
+    uint64_t* key = new uint64_t[x_keyLenU64];
+    for (size_t j = 0; j < x_keyLenU64; ++j) {
+      key[j] = idx;
+    }
+
+    ReadContext context{ reinterpret_cast<uint8_t*>(key), x_keyLenU64 * 8 };
+    context.output = 0;
+
+    static int queryIdx;
+    queryIdx = idx;
+    auto callback = [](IAsyncContext* ctxt, Status result) {
+      assert(result == Status::Ok);
+      ReadContext* c = static_cast<ReadContext*>(ctxt);
+      if (queryIdx < 50000 || (100000 <= queryIdx && queryIdx < 150000))
+      {
+        assert(c->output == 1);
+      } else {
+        assert(c->output == 85);
+      }
+      cb_call_cnt++;
+    };
+
+    Status result = store.Read(context, callback, 1);
+    if (result == Status::Ok)
+    {
+      if (queryIdx < 50000 || (100000 <= queryIdx && queryIdx < 150000))
+      {
+        assert(context.output == 1);
+      } else {
+        assert(context.output == 85);
+      }
+    }
+    else
+    {
+      pending_cnt++;
+      assert(result == Status::Pending);
+      store.CompletePending(true);
+      store.GetColdLog()->CompletePending(true);
+    }
+
+    if (i % 1000 == 0)
+    {
+      printf("read %d/%d\n", int(i), 10000);
+    }
+  }
+  printf("read: total %d pending codepath\n", pending_cnt);
+  assert(cb_call_cnt == pending_cnt);
+
+  store.StopSession();
+}
+
 int main(int argc, char** argv) {
   ::testing::InitGoogleTest(&argc, argv);
   return RUN_ALL_TESTS();

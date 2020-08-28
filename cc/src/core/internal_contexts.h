@@ -644,6 +644,109 @@ class WrappedAsyncPendingDeleteContext : public IAsyncContext {
   shallow_key_t shallow_key_;
 };
 
+template <class K>
+class HotColdLogCompactionShallowKey {
+public:
+  HotColdLogCompactionShallowKey(K* key)
+    : key_(key) {
+  }
+  inline uint32_t size() const {
+    return key_->size();
+  }
+  inline KeyHash GetHash() const {
+    return key_->GetHash();
+  }
+  inline void write_deep_key_at(K* dst) const {
+    memcpy(dst, key_, size());
+  }
+  /// Comparison operators.
+  inline bool operator==(const K& other) const {
+    return (*key_) == other;
+  }
+  inline bool operator!=(const K& other) const {
+    return !(*this == other);
+  }
+  K* key_;
+};
+
+template <class K, class V>
+class HotColdLogCompactionDeleteContext : public IAsyncContext {
+ public:
+  typedef K key_t;
+  typedef V value_t;
+  using shallow_key_t = HotColdLogCompactionShallowKey<K>;
+
+  HotColdLogCompactionDeleteContext(K* key, size_t value_size)
+    : key_(key)
+    , shallow_key_(key)
+    , value_size_(value_size) {
+  }
+  /// The deep copy constructor.
+  HotColdLogCompactionDeleteContext(HotColdLogCompactionDeleteContext& other)
+    : key_(other.key_), shallow_key_(other.shallow_key_), value_size_(other.value_size_) {
+  }
+ protected:
+  /// The explicit interface requires a DeepCopy_Internal() implementation.
+  Status DeepCopy_Internal(IAsyncContext*& context_copy) {
+    return IAsyncContext::DeepCopy_Internal(*this, context_copy);
+  }
+ public:
+  const shallow_key_t& key() const { return shallow_key_; }
+  uint32_t value_size() const { return value_size_; }
+
+  K* key_;
+  shallow_key_t shallow_key_;
+  size_t value_size_;
+};
+
+template <class K, class V>
+class HotColdLogCompactionUpsertContext : public IAsyncContext {
+public:
+  typedef K key_t;
+  typedef V value_t;
+  using shallow_key_t = HotColdLogCompactionShallowKey<K>;
+
+  HotColdLogCompactionUpsertContext(K* key, V* value)
+    : shallow_key_{ key }, value_(value) {
+  }
+
+  HotColdLogCompactionUpsertContext(const HotColdLogCompactionUpsertContext& other)
+    : shallow_key_{ other.shallow_key_ }, value_(other.value_) {
+  }
+
+  inline const shallow_key_t& key() const {
+    return shallow_key_;
+  }
+
+  inline constexpr uint32_t value_size() const {
+    return value_->size();
+  }
+
+  inline void Put(value_t& value) {
+    memcpy(&value, value_, value_size());
+  }
+
+  inline bool PutAtomic(value_t& value) {
+    // TODO: fix
+    memcpy(&value, value_, value_size());
+    return true;
+  }
+
+protected:
+    /// The explicit interface requires a DeepCopy_Internal() implementation.
+    Status DeepCopy_Internal(IAsyncContext*& context_copy) {
+      // In this particular test, the key content is always on the heap and always available,
+      // so we don't need to copy the key content. If the key content were on the stack,
+      // we would need to copy the key content to the heap as well
+      //
+      return IAsyncContext::DeepCopy_Internal(*this, context_copy);
+    }
+
+private:
+    shallow_key_t shallow_key_;
+    V* value_;
+};
+
 class AsyncIOContext;
 
 /// Per-thread execution context. (Just the stuff that's checkpointed to disk.)

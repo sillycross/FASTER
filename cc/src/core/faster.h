@@ -159,6 +159,9 @@ class FasterKv {
   /// Log compaction entry method.
   bool Compact(uint64_t untilAddress);
 
+  void BatchInsertIntoColdLog(const std::vector<Record<K,V>*>& list);
+  void CompactHotLog(GcState::complete_callback_t complete_callback);
+
   /// Truncating the head of the log.
   bool ShiftBeginAddress(Address address, GcState::truncate_callback_t truncate_callback,
                          GcState::complete_callback_t complete_callback);
@@ -287,7 +290,7 @@ class FasterKv {
                     HashBucketEntry entry);
 
   Address LogScanForValidity(Address from, faster_t* temp);
-  bool ContainsKeyInMemory(key_t key, Address offset);
+  bool ContainsKeyInMemory(const key_t& key, Address offset);
 
   /// Access the current and previous (thread-local) execution contexts.
   const ExecutionContext& thread_ctx() const {
@@ -3261,6 +3264,175 @@ bool FasterKv<K, V, D, isHotColdLog>::Compact(uint64_t untilAddress)
   return true;
 }
 
+class SimpleArenaAllocator
+{
+public:
+  SimpleArenaAllocator() {
+    Reset();
+  }
+
+  ~SimpleArenaAllocator() {
+    for (uint8_t* ptr : allBuffer_)
+    {
+      delete [] ptr;
+    }
+    for (uint8_t* ptr : largeBuffer_)
+    {
+      delete [] ptr;
+    }
+  }
+
+  void Reset() {
+    if (allBuffer_.size() == 0) {
+      allBuffer_.push_back(new uint8_t[x_blockSize]);
+    }
+    curBuffer_ = 0;
+    curPtr_ = allBuffer_[0];
+    for (uint8_t* ptr : largeBuffer_)
+    {
+      delete [] ptr;
+    }
+    largeBuffer_.clear();
+  }
+
+  uint8_t* Allocate(size_t requestSize) {
+    requestSize = (requestSize + 7) / 8 * 8;
+    if (requestSize == 0) { requestSize = 8; }
+    if (requestSize > x_blockSize) {
+      largeBuffer_.push_back(new uint8_t[requestSize]);
+      return largeBuffer_.back();
+    }
+    assert(curBuffer_ < allBuffer_.size());
+    if (curPtr_ + requestSize > allBuffer_[curBuffer_] + x_blockSize) {
+      if (curBuffer_ == allBuffer_.size() - 1) {
+        allBuffer_.push_back(new uint8_t[x_blockSize]);
+      }
+      curBuffer_++;
+      curPtr_ = allBuffer_[curBuffer_];
+    }
+    uint8_t* result = curPtr_;
+    curPtr_ += requestSize;
+    return result;
+  }
+
+private:
+  static const size_t x_blockSize = 131072;
+  std::vector<uint8_t*> allBuffer_;
+  std::vector<uint8_t*> largeBuffer_;
+  size_t curBuffer_;
+  uint8_t* curPtr_;
+};
+
+template <class K, class V, class D, bool isHotColdLog>
+void FasterKv<K, V, D, isHotColdLog>::BatchInsertIntoColdLog(const std::vector<Record<K,V>*>& list)
+{
+  for (record_t* record : list) {
+    if (record == nullptr) {
+      // this is an invalidated record.
+      continue;
+    }
+    if (record->header.tombstone) {
+      // we need to delete the record in cold log, if it exists
+      // if it does not exist, do nothing
+      HotColdLogCompactionDeleteContext<K, V> ctxt(const_cast<K*>(&record->key()), record->value().size());
+      auto cb = [](IAsyncContext* c, Status r) {};
+      // TODO: figure out the correct serial_num
+      cold_faster_->Delete(ctxt, cb, 1);
+    } else {
+      // we need to insert the record into cold log
+      HotColdLogCompactionUpsertContext<K, V> ctxt(const_cast<K*>(&record->key()), const_cast<V*>(&record->value()));
+      auto cb = [](IAsyncContext* c, Status r) {};
+      // TODO: figure out the correct serial_num
+      cold_faster_->Upsert(ctxt, cb, 1);
+    }
+  }
+  cold_faster_->CompletePending(true);
+}
+
+template <class K, class V, class D, bool isHotColdLog>
+void FasterKv<K, V, D, isHotColdLog>::CompactHotLog(GcState::complete_callback_t complete_callback)
+{
+  assert(isHotColdLog);
+  Address begin = hlog.begin_address.load();
+  Address end = hlog.safe_read_only_address.load();
+  ScanIterator<faster_t> iter(&hlog, Buffering::DOUBLE_PAGE, begin, end, &disk);
+
+  struct KeyHashHelper {
+    using KeyType = K*;
+      size_t operator()(const KeyType& k) const noexcept {
+          return k->GetHash().GetControl();
+      }
+  };
+
+  struct KeyEqualHelper {
+      using KeyType = K*;
+      bool operator()(const KeyType& k1, const KeyType& k2) const noexcept {
+          if (k1 == k2) {
+            return true;
+          }
+          return (*k1) == (*k2);
+      }
+  };
+
+  const static size_t x_packSize = 1000;
+  SimpleArenaAllocator alloc;
+  std::vector<record_t*> list;
+  list.reserve(x_packSize);
+  std::unordered_map<K*, size_t, KeyHashHelper, KeyEqualHelper> exist;
+
+  while (true) {
+    const record_t* r = iter.GetNext();
+    if (r == nullptr) break;
+
+    if (r->header.IsNull()) {
+      continue;
+    }
+    if (r->header.invalid) {
+      continue;
+    }
+
+    // ContainsKeyInMemory is purely an optimization:
+    // it is always safe and correct to write the record into cold log,
+    // only that it is a waste if the record is no longer the most recent version.
+    // So we don't need to worry about race conditions about keys being updated concurrently,
+    // or if the key exists on disk but not in memory.
+    if (!ContainsKeyInMemory(r->key(), end))
+    {
+      record_t* buffer = reinterpret_cast<record_t*>(alloc.Allocate(r->size()));
+      memcpy(buffer, r, r->size());
+      list.push_back(buffer);
+      key_t* key = const_cast<key_t*>(&(buffer->key()));
+      if (exist.count(key)) {
+        // The key already showed up in this batch.
+        // We need to invalidate the prior record: each batch is inserted into cold log out-of-order
+        // due to the asynchrounous nature, we must invalidate the prior record to make sure this
+        // record actually overwrites the prior one.
+        auto it = exist.find(key);
+        assert(it != exist.end() && it->second < list.size() - 1);
+        assert(list[it->second] != nullptr);
+        list[it->second] = nullptr;
+        it->second = list.size() - 1;
+      } else {
+        exist[key] = list.size() - 1;
+      }
+      if (list.size() == x_packSize) {
+        BatchInsertIntoColdLog(list);
+        list.clear();
+        exist.clear();
+        alloc.Reset();
+      }
+    }
+  }
+  if (list.size() > 0)
+  {
+    BatchInsertIntoColdLog(list);
+  }
+
+  auto truncate_callback = [](uint64_t offset) {};
+  bool success = ShiftBeginAddress(end, truncate_callback, complete_callback);
+  assert(success);  // TODO: what happens if it fails?
+}
+
 /// Scans the hybrid log starting at `from` until the safe-read-only address,
 /// deleting all encountered records from within a passed in temporary FASTER
 /// instance.
@@ -3313,7 +3485,7 @@ Address FasterKv<K, V, D, isHotColdLog>::LogScanForValidity(Address from, faster
 /// Checks if a key exists between a passed in address (`offset`) and the
 /// current tail of the hybrid log.
 template <class K, class V, class D, bool isHotColdLog>
-bool FasterKv<K, V, D, isHotColdLog>::ContainsKeyInMemory(key_t key, Address offset)
+bool FasterKv<K, V, D, isHotColdLog>::ContainsKeyInMemory(const key_t& key, Address offset)
 {
   // First, retrieve the hash table entry corresponding to this key.
   KeyHash hash = key.GetHash();
