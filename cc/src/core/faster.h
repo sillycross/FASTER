@@ -406,6 +406,9 @@ inline void FasterKv<K, V, D, isHotColdLog>::Refresh() {
   // We check if we are in normal mode
   SystemState new_state = system_state_.load();
   if(thread_ctx().phase == Phase::REST && new_state.phase == Phase::REST) {
+    if (isHotColdLog) {
+      cold_faster_->Refresh();
+    }
     return;
   }
   HandleSpecialPhases();
