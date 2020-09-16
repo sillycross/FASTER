@@ -159,7 +159,7 @@ class FasterKv {
   /// Log compaction entry method.
   bool Compact(uint64_t untilAddress);
 
-  void BatchInsertIntoColdLog(const std::vector<Record<K,V>*>& list);
+  void BatchInsertIntoColdLog(std::pair<Record<K,V>*, bool>* list, int num);
   void CompactHotLog(GcState::complete_callback_t complete_callback);
 
   /// Truncating the head of the log.
@@ -623,13 +623,15 @@ inline Status FasterKv<K, V, D, isHotColdLog>::Read(RC& context, AsyncCallback c
                 "alignof(value_t) != alignof(typename read_context_t::value_t)");
 
   pending_read_context_t pending_context{ context, callback };
-  pending_context.set_is_hotlog_phase(isHotColdLog);
+  if (std::is_same<RC, SpecialAddressQueryContext<K, V>>::value) {
+    pending_context.set_is_special_address_query(true);
+  }
   OperationStatus internal_status = InternalRead(pending_context);
   Status status;
   if(internal_status == OperationStatus::SUCCESS) {
     status = Status::Ok;
   } else if(internal_status == OperationStatus::NOT_FOUND) {
-    if (isHotColdLog) {
+    if (isHotColdLog && !pending_context.is_special_address_query) {
       status = cold_faster_->Read(context, callback, monotonic_serial_num);
     } else {
       status = Status::NotFound;
@@ -642,7 +644,11 @@ inline Status FasterKv<K, V, D, isHotColdLog>::Read(RC& context, AsyncCallback c
     bool async;
     status = HandleOperationStatus(thread_ctx(), pending_context, internal_status, async);
     if (status == Status::NotFound && isHotColdLog) {
-      status = cold_faster_->Read(context, callback, monotonic_serial_num);
+      if (!pending_context.is_special_address_query) {
+        status = cold_faster_->Read(context, callback, monotonic_serial_num);
+      } else {
+        status = Status::NotFound;
+      }
     } else if (status == Status::NotFoundHotLogTombstone) {
       assert(isHotColdLog);
       status = Status::NotFound;
@@ -782,7 +788,7 @@ inline void FasterKv<K, V, D, isHotColdLog>::CompleteIoPendingRequests(Execution
       result = Status::Ok;
     } else if(internal_status == OperationStatus::NOT_FOUND) {
       if(pending_context->type == OperationType::Read) {
-        if (isHotColdLog) {
+        if (isHotColdLog && !pending_context->is_special_address_query) {
           WrappedAsyncPendingReadContext<K, V> wctxt(static_cast<async_pending_read_context_t*>(pending_context.get()));
           result = cold_faster_->Read(wctxt, pending_context->caller_callback, thread_ctx().serial_num);
           assert(result == Status::Ok || result == Status::NotFound || result == Status::Pending);
@@ -806,11 +812,15 @@ inline void FasterKv<K, V, D, isHotColdLog>::CompleteIoPendingRequests(Execution
                                      pending_context.async);
       if(pending_context->type == OperationType::Read) {
         if (internal_status == OperationStatus::NOT_FOUND_UNMARK && isHotColdLog) {
-          assert(!pending_context.async);
-          WrappedAsyncPendingReadContext<K, V> wctxt(static_cast<async_pending_read_context_t*>(pending_context.get()));
-          result = cold_faster_->Read(wctxt, pending_context->caller_callback, thread_ctx().serial_num);
-          assert(result == Status::Ok || result == Status::NotFound || result == Status::Pending);
-          pending_context.async = (result == Status::Pending);
+          if (!pending_context->is_special_address_query) {
+            assert(!pending_context.async);
+            WrappedAsyncPendingReadContext<K, V> wctxt(static_cast<async_pending_read_context_t*>(pending_context.get()));
+            result = cold_faster_->Read(wctxt, pending_context->caller_callback, thread_ctx().serial_num);
+            assert(result == Status::Ok || result == Status::NotFound || result == Status::Pending);
+            pending_context.async = (result == Status::Pending);
+          } else {
+            assert(result == Status::NotFound);
+          }
         } else if (internal_status == OperationStatus::NOT_FOUND_UNMARK_HOTLOG_TOMBSTONE) {
           assert(isHotColdLog && result == Status::NotFound);
         }
@@ -917,6 +927,10 @@ inline OperationStatus FasterKv<K, V, D, isHotColdLog>::InternalRead(C& pending_
     if (reinterpret_cast<const record_t*>(hlog.Get(address))->header.tombstone) {
       if (isHotColdLog)
       {
+        if (pending_context.is_special_address_query)
+        {
+          pending_context.GetV(reinterpret_cast<const V*>(address.control()));
+        }
         return OperationStatus::NOT_FOUND_HOTLOG_TOMBSTONE;
       }
       else
@@ -924,7 +938,14 @@ inline OperationStatus FasterKv<K, V, D, isHotColdLog>::InternalRead(C& pending_
         return OperationStatus::NOT_FOUND;
       }
     }
-    pending_context.GetAtomic(hlog.Get(address));
+    if (pending_context.is_special_address_query)
+    {
+        pending_context.GetV(reinterpret_cast<const V*>(address.control()));
+    }
+    else
+    {
+        pending_context.GetAtomic(hlog.Get(address));
+    }
     return OperationStatus::SUCCESS;
   } else if(address >= head_address) {
     // Immutable region
@@ -932,6 +953,10 @@ inline OperationStatus FasterKv<K, V, D, isHotColdLog>::InternalRead(C& pending_
     if (reinterpret_cast<const record_t*>(hlog.Get(address))->header.tombstone) {
       if (isHotColdLog)
       {
+        if (pending_context.is_special_address_query)
+        {
+          pending_context.GetV(reinterpret_cast<const V*>(address.control()));
+        }
         return OperationStatus::NOT_FOUND_HOTLOG_TOMBSTONE;
       }
       else
@@ -939,7 +964,14 @@ inline OperationStatus FasterKv<K, V, D, isHotColdLog>::InternalRead(C& pending_
         return OperationStatus::NOT_FOUND;
       }
     }
-    pending_context.Get(hlog.Get(address));
+    if (pending_context.is_special_address_query)
+    {
+        pending_context.GetV(reinterpret_cast<const V*>(address.control()));
+    }
+    else
+    {
+        pending_context.Get(hlog.Get(address));
+    }
     return OperationStatus::SUCCESS;
   } else if(address >= begin_address) {
     // Record not available in-memory
@@ -1725,6 +1757,10 @@ OperationStatus FasterKv<K, V, D, isHotColdLog>::InternalContinuePendingRead(Exe
     record_t* record = reinterpret_cast<record_t*>(io_context.record.GetValidPointer());
     if(record->header.tombstone) {
       if (isHotColdLog) {
+        if (pending_context->is_special_address_query)
+        {
+          pending_context->GetV(reinterpret_cast<const V*>(io_context.address.control()));
+        }
         return (thread_ctx().version > context.version) ? OperationStatus::NOT_FOUND_UNMARK_HOTLOG_TOMBSTONE :
                OperationStatus::NOT_FOUND_HOTLOG_TOMBSTONE;
       } else {
@@ -1732,7 +1768,14 @@ OperationStatus FasterKv<K, V, D, isHotColdLog>::InternalContinuePendingRead(Exe
                OperationStatus::NOT_FOUND;
       }
     }
-    pending_context->Get(record);
+    if (pending_context->is_special_address_query)
+    {
+        pending_context->GetV(reinterpret_cast<const V*>(io_context.address.control()));
+    }
+    else
+    {
+        pending_context->Get(record);
+    }
     assert(!kCopyReadsToTail);
     return (thread_ctx().version > context.version) ? OperationStatus::SUCCESS_UNMARK :
            OperationStatus::SUCCESS;
@@ -3327,9 +3370,14 @@ private:
 };
 
 template <class K, class V, class D, bool isHotColdLog>
-void FasterKv<K, V, D, isHotColdLog>::BatchInsertIntoColdLog(const std::vector<Record<K,V>*>& list)
+void FasterKv<K, V, D, isHotColdLog>::BatchInsertIntoColdLog(std::pair<Record<K,V>*, bool>* list, int num)
 {
-  for (record_t* record : list) {
+  CompletePending(true);
+  for (int i = 0; i < num; i++) {
+    if (!list[i].second) {
+      continue;
+    }
+    record_t* record = list[i].first;
     if (record == nullptr) {
       // this is an invalidated record.
       continue;
@@ -3379,12 +3427,13 @@ void FasterKv<K, V, D, isHotColdLog>::CompactHotLog(GcState::complete_callback_t
 
   const static size_t x_packSize = 1000;
   SimpleArenaAllocator alloc;
-  std::vector<record_t*> list;
-  list.reserve(x_packSize);
-  std::unordered_map<K*, size_t, KeyHashHelper, KeyEqualHelper> exist;
+  std::unique_ptr<std::pair<record_t*, bool>[]> list(new std::pair<record_t*, bool>[x_packSize]);
 
+  int num = 0;
   while (true) {
-    const record_t* r = iter.GetNext();
+    std::pair<Address, record_t*> pair = iter.GetNextRecordAndAddress();
+    record_t* r = pair.second;
+    Address addr = pair.first;
     if (r == nullptr) break;
 
     if (r->header.IsNull()) {
@@ -3394,41 +3443,27 @@ void FasterKv<K, V, D, isHotColdLog>::CompactHotLog(GcState::complete_callback_t
       continue;
     }
 
-    // ContainsKeyInMemory is purely an optimization:
-    // it is always safe and correct to write the record into cold log,
-    // only that it is a waste if the record is no longer the most recent version.
-    // So we don't need to worry about race conditions about keys being updated concurrently,
-    // or if the key exists on disk but not in memory.
-    if (!ContainsKeyInMemory(r->key(), end))
-    {
-      record_t* buffer = reinterpret_cast<record_t*>(alloc.Allocate(r->size()));
-      memcpy(buffer, r, r->size());
-      list.push_back(buffer);
-      key_t* key = const_cast<key_t*>(&(buffer->key()));
-      if (exist.count(key)) {
-        // The key already showed up in this batch.
-        // We need to invalidate the prior record: each batch is inserted into cold log out-of-order
-        // due to the asynchrounous nature, we must invalidate the prior record to make sure this
-        // record actually overwrites the prior one.
-        auto it = exist.find(key);
-        assert(it != exist.end() && it->second < list.size() - 1);
-        assert(list[it->second] != nullptr);
-        list[it->second] = nullptr;
-        it->second = list.size() - 1;
-      } else {
-        exist[key] = list.size() - 1;
-      }
-      if (list.size() == x_packSize) {
-        BatchInsertIntoColdLog(list);
-        list.clear();
-        exist.clear();
-        alloc.Reset();
-      }
+    record_t* buffer = reinterpret_cast<record_t*>(alloc.Allocate(r->size()));
+    memcpy(buffer, r, r->size());
+    key_t* key = const_cast<key_t*>(&(buffer->key()));
+
+    list[num] = std::make_pair(buffer, false);
+
+    SpecialAddressQueryContext<K, V> context { key, addr, &list[num].second };
+    auto callback = [](IAsyncContext* ctxt, Status result) {};
+    Read(context, callback, 1);
+
+    num++;
+
+    if (num == x_packSize) {
+      BatchInsertIntoColdLog(list.get(), num);
+      alloc.Reset();
+      num = 0;
     }
   }
-  if (list.size() > 0)
+  if (num > 0)
   {
-    BatchInsertIntoColdLog(list);
+    BatchInsertIntoColdLog(list.get(), num);
   }
 
   auto truncate_callback = [](uint64_t offset) {};

@@ -66,7 +66,7 @@ class PendingContext : public IAsyncContext {
     , result{ Status::Pending }
     , address{ Address::kInvalidAddress }
     , entry{ HashBucketEntry::kInvalidEntry }
-    , is_hotlog_phase(false) {
+    , is_special_address_query(false) {
   }
 
  public:
@@ -80,7 +80,7 @@ class PendingContext : public IAsyncContext {
     , result{ other.result }
     , address{ other.address }
     , entry{ other.entry }
-    , is_hotlog_phase { other.is_hotlog_phase } {
+    , is_special_address_query { other.is_special_address_query } {
   }
 
  public:
@@ -98,8 +98,8 @@ class PendingContext : public IAsyncContext {
     entry = entry_;
   }
 
-  void set_is_hotlog_phase(bool value) {
-    is_hotlog_phase = value;
+  void set_is_special_address_query(bool value) {
+    is_special_address_query = value;
   }
 
   virtual uint32_t key_size() const = 0;
@@ -124,7 +124,7 @@ class PendingContext : public IAsyncContext {
   /// Hash table entry that (indirectly) leads to the record being read or modified.
   HashBucketEntry entry;
   /// whether we are in the hot log phase for hot-cold separated FasterKV
-  bool is_hotlog_phase;
+  bool is_special_address_query;
 };
 
 // A helper class to copy the key into FASTER log.
@@ -294,6 +294,69 @@ protected:
   // TODO: figure out when this should be freed
   AsyncPendingReadContext<K>* ctxt_;
   shallow_key_t shallow_key_;
+};
+
+template <class K>
+class SpecialAddressQueryContextShallowKey {
+public:
+  SpecialAddressQueryContextShallowKey(K* key)
+    : key_(key) {
+  }
+  inline uint32_t size() const {
+    return key_->size();
+  }
+  inline KeyHash GetHash() const {
+    return key_->GetHash();
+  }
+  inline void write_deep_key_at(K* dst) const {
+    memcpy(dst, key_, size());
+  }
+  /// Comparison operators.
+  inline bool operator==(const K& other) const {
+    return (*key_ == other);
+  }
+  inline bool operator!=(const K& other) const {
+    return !(*this == other);
+  }
+  K* key_;
+};
+
+/// A wrapper of AsyncPendingReadContext, that allows it to be passed to Read again
+template <class K, class V>
+class SpecialAddressQueryContext : public IAsyncContext {
+ public:
+  typedef K key_t;
+  typedef V value_t;
+  using shallow_key_t = SpecialAddressQueryContextShallowKey<K>;
+
+  SpecialAddressQueryContext(K* key, Address expectedAddress, bool* isAliveOutput)
+    : shallow_key_(key)
+    , expectedAddress_(expectedAddress)
+    , isAliveOutput_(isAliveOutput) {
+  }
+  /// The deep copy constructor.
+  SpecialAddressQueryContext(SpecialAddressQueryContext& other)
+    : shallow_key_(other.shallow_key_), expectedAddress_(other.expectedAddress_), isAliveOutput_(other.isAliveOutput_) {
+  }
+protected:
+    /// The explicit interface requires a DeepCopy_Internal() implementation.
+    Status DeepCopy_Internal(IAsyncContext*& context_copy) {
+      return IAsyncContext::DeepCopy_Internal(*this, context_copy);
+    }
+ public:
+  const shallow_key_t& key() const { return shallow_key_; }
+  void Get(const value_t& value) {
+    Address addr { reinterpret_cast<uint64_t>(&value) };
+    if (addr == expectedAddress_) {
+      *isAliveOutput_ = true;
+    }
+  }
+  void GetAtomic(const value_t& value) { assert(false); }
+
+  // TODO: figure out when this should be freed
+  shallow_key_t shallow_key_;
+  Address expectedAddress_;
+  bool* isAliveOutput_;
 };
 
 /// FASTER's internal Upsert() context.

@@ -106,27 +106,32 @@ class ScanIterator {
   ScanIterator& operator=(const ScanIterator& from) = delete;
 
   /// Returns a pointer to the next record.
-  record_t* GetNext() {
+  std::pair<Address, record_t*> GetNextRecordAndAddress() {
     // We've exceeded the range over which we had to perform our scan.
     // No work to do over here other than returning a nullptr.
-    if (current >= until) return nullptr;
+    if (current >= until) return std::make_pair(Address(), nullptr);
 
     // If we're within the in-memory region, then just lookup the address,
     // increment it and return a pointer to the record.
     if (current >= hLog->head_address.load()) {
+      Address ret = current;
       auto record = reinterpret_cast<record_t*>(hLog->Get(current));
       current += record->size();
-      return record;
+      return std::make_pair(ret, record);
     }
 
     // If we're over here then we need to issue reads to persistent storage.
     return blockAndLoad();
   }
 
+  record_t* GetNext() {
+    return GetNextRecordAndAddress().second;
+  }
+
  private:
   /// Loads pages from persistent storage if needed, and returns a pointer
   /// to the next record in the log.
-  record_t* blockAndLoad() {
+  std::pair<Address, record_t*> blockAndLoad() {
     // We are at the first address of the first frame in the buffer. Issue
     // an IO to the persistent layer and then wait for it to complete.
     if (currentFrame == 0 && (current.offset() == 0 || isFirst)) {
@@ -155,11 +160,12 @@ class ScanIterator {
     // We have the corresponding page in our buffer. Look it up, increment
     // the current address and current frame (if necessary), return a
     // pointer to the record.
+    Address ret = current;
     auto record = reinterpret_cast<record_t*>(frames[currentFrame] +
                                               current.offset());
     current += record->size();
     if (current.offset() == 0) currentFrame = (currentFrame + 1) % numFrames;
-    return record;
+    return std::make_pair(ret, record);
   }
 
   /// Passed in to the persistent layer when reading pages. Contains a pointer
