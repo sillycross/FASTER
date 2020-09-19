@@ -75,11 +75,16 @@ class alignas(Constants::kCacheLineBytes) ThreadContext {
 static_assert(sizeof(ThreadContext) == 448, "sizeof(ThreadContext) != 448");
 
 /// The FASTER key-value store.
-template <class K, class V, class D, bool isHotColdLog = false>
+template <class K, class V, class D, bool isHotColdLog = false, bool isTwoLevelHashTable = false>
 class FasterKv {
  public:
-  typedef FasterKv<K, V, D, isHotColdLog> faster_t;
-  typedef FasterKv<K, V, D, false> cold_faster_t;   // not used if isHotColdLog == false
+  typedef FasterKv<K, V, D, isHotColdLog, isTwoLevelHashTable> faster_t;
+  /// The cold-log faster instance
+  /// only used if isHotColdLog == true
+  typedef FasterKv<K, V, D, false /*isHotColdLog*/, isTwoLevelHashTable> cold_faster_t;
+  /// The disk hash table
+  /// only used if isHotColdLog == false && isTwoLevelHashTable == true
+  typedef FasterKv<FasterUInt64Key, DiskHashBucket, D, false /*isHotColdLog*/, false /*isTwoLevelHashTable*/> disk_ht_t;
 
   /// Keys and values stored in this key-value store.
   typedef K key_t;
@@ -116,8 +121,13 @@ class FasterKv {
     state_[0].Initialize(table_size, disk.log().alignment());
     overflow_buckets_allocator_[0].Initialize(disk.log().alignment(), epoch_);
 
+    // TODO: allow independently specify hot log size, cold log size, on-disk hash table size
+    //
     if (isHotColdLog) {
       cold_faster_ = new cold_faster_t(table_size, log_size, filename + "_cold", log_mutable_fraction, pre_allocate_log);
+    }
+    if (!isHotColdLog && isTwoLevelHashTable) {
+      disk_ht_ = new disk_ht_t(table_size, log_size, filename + "_diskht", log_mutable_fraction, pre_allocate_log);
     }
   }
 
@@ -178,7 +188,7 @@ class FasterKv {
       overflow_buckets_allocator_[resize_info_.version]);
   }
 
-  void StartSessionColdLog(Guid guid);
+  void StartSessionUsingGuid(Guid guid);
 
  private:
   typedef Record<key_t, value_t> record_t;
@@ -221,6 +231,7 @@ class FasterKv {
   // create a new entry. The caller can use the "expected_entry" to CAS its desired address into
   // the entry.
   inline AtomicHashBucketEntry* FindOrCreateEntry(KeyHash hash, HashBucketEntry& expected_entry);
+
   template<class C>
   inline Address TraceBackForKeyMatchCtxt(const C& ctxt, Address from_address,
                                       Address min_offset) const;
@@ -293,12 +304,14 @@ class FasterKv {
   bool ContainsKeyInMemory(const key_t& key, Address offset);
 
   /// Access the current and previous (thread-local) execution contexts.
+ public:
   const ExecutionContext& thread_ctx() const {
     return thread_contexts_[Thread::id()].cur();
   }
   ExecutionContext& thread_ctx() {
     return thread_contexts_[Thread::id()].cur();
   }
+ private:
   ExecutionContext& prev_thread_ctx() {
     return thread_contexts_[Thread::id()].prev();
   }
@@ -348,41 +361,52 @@ class FasterKv {
   /// Global count of pending I/Os, used for throttling.
   std::atomic<uint64_t> num_pending_ios;
 
+public:
   /// the cold faster instance when hot-cold log is enabled
   cold_faster_t* cold_faster_;
 
+  /// the faster for on-disk hash table when two-level hash table is enabled
+  disk_ht_t* disk_ht_;
+
+private:
   /// Space for two contexts per thread, stored inline.
   ThreadContext thread_contexts_[Thread::kMaxNumThreads];
 };
 
 // Implementations.
-template <class K, class V, class D, bool isHotColdLog>
-inline Guid FasterKv<K, V, D, isHotColdLog>::StartSession() {
+template <class K, class V, class D, bool isHotColdLog, bool isTwoLevelHashTable>
+inline Guid FasterKv<K, V, D, isHotColdLog, isTwoLevelHashTable>::StartSession() {
   SystemState state = system_state_.load();
   if(state.phase != Phase::REST) {
     throw std::runtime_error{ "Can acquire only in REST phase!" };
   }
   thread_ctx().Initialize(state.phase, state.version, Guid::Create(), 0);
   if (isHotColdLog) {
-    cold_faster_->StartSessionColdLog(thread_ctx().guid);
+    cold_faster_->StartSessionUsingGuid(thread_ctx().guid);
+  }
+  if (!isHotColdLog && isTwoLevelHashTable) {
+    disk_ht_->StartSessionUsingGuid(thread_ctx().guid);
   }
   Refresh();
   return thread_ctx().guid;
 }
 
-template <class K, class V, class D, bool isHotColdLog>
-inline void FasterKv<K, V, D, isHotColdLog>::StartSessionColdLog(Guid guid) {
+template <class K, class V, class D, bool isHotColdLog, bool isTwoLevelHashTable>
+inline void FasterKv<K, V, D, isHotColdLog, isTwoLevelHashTable>::StartSessionUsingGuid(Guid guid) {
   assert(!isHotColdLog);
   SystemState state = system_state_.load();
   if(state.phase != Phase::REST) {
     throw std::runtime_error{ "Can acquire only in REST phase!" };
   }
   thread_ctx().Initialize(state.phase, state.version, guid, 0);
+  if (!isHotColdLog && isTwoLevelHashTable) {
+    disk_ht_->StartSessionUsingGuid(guid);
+  }
   Refresh();
 }
 
-template <class K, class V, class D, bool isHotColdLog>
-inline uint64_t FasterKv<K, V, D, isHotColdLog>::ContinueSession(const Guid& session_id) {
+template <class K, class V, class D, bool isHotColdLog, bool isTwoLevelHashTable>
+inline uint64_t FasterKv<K, V, D, isHotColdLog, isTwoLevelHashTable>::ContinueSession(const Guid& session_id) {
   auto iter = checkpoint_.continue_tokens.find(session_id);
   if(iter == checkpoint_.continue_tokens.end()) {
     throw std::invalid_argument{ "Unknown session ID" };
@@ -396,12 +420,15 @@ inline uint64_t FasterKv<K, V, D, isHotColdLog>::ContinueSession(const Guid& ses
   if (isHotColdLog) {
     cold_faster_->ContinueSession(session_id);
   }
+  if (!isHotColdLog && isTwoLevelHashTable) {
+    disk_ht_->ContinueSession(session_id);
+  }
   Refresh();
   return iter->second;
 }
 
-template <class K, class V, class D, bool isHotColdLog>
-inline void FasterKv<K, V, D, isHotColdLog>::Refresh() {
+template <class K, class V, class D, bool isHotColdLog, bool isTwoLevelHashTable>
+inline void FasterKv<K, V, D, isHotColdLog, isTwoLevelHashTable>::Refresh() {
   epoch_.ProtectAndDrain();
   // We check if we are in normal mode
   SystemState new_state = system_state_.load();
@@ -409,16 +436,22 @@ inline void FasterKv<K, V, D, isHotColdLog>::Refresh() {
     if (isHotColdLog) {
       cold_faster_->Refresh();
     }
+    if (!isHotColdLog && isTwoLevelHashTable) {
+      disk_ht_->Refresh();
+    }
     return;
   }
   HandleSpecialPhases();
   if (isHotColdLog) {
     cold_faster_->Refresh();
   }
+  if (!isHotColdLog && isTwoLevelHashTable) {
+    disk_ht_->Refresh();
+  }
 }
 
-template <class K, class V, class D, bool isHotColdLog>
-inline void FasterKv<K, V, D, isHotColdLog>::StopSession() {
+template <class K, class V, class D, bool isHotColdLog, bool isTwoLevelHashTable>
+inline void FasterKv<K, V, D, isHotColdLog, isTwoLevelHashTable>::StopSession() {
   // If this thread is still involved in some activity, wait until it finishes.
   while(thread_ctx().phase != Phase::REST ||
         !thread_ctx().pending_ios.empty() ||
@@ -440,11 +473,14 @@ inline void FasterKv<K, V, D, isHotColdLog>::StopSession() {
   if (isHotColdLog) {
     cold_faster_->StopSession();
   }
+  if (!isHotColdLog && isTwoLevelHashTable) {
+    disk_ht_->StopSession();
+  }
   epoch_.Unprotect();
 }
 
-template <class K, class V, class D, bool isHotColdLog>
-inline const AtomicHashBucketEntry* FasterKv<K, V, D, isHotColdLog>::FindEntry(KeyHash hash,
+template <class K, class V, class D, bool isHotColdLog, bool isTwoLevelHashTable>
+inline const AtomicHashBucketEntry* FasterKv<K, V, D, isHotColdLog, isTwoLevelHashTable>::FindEntry(KeyHash hash,
     HashBucketEntry& expected_entry) const {
   expected_entry = HashBucketEntry::kInvalidEntry;
   // Truncate the hash to get a bucket page_index < state[version].size.
@@ -484,8 +520,8 @@ inline const AtomicHashBucketEntry* FasterKv<K, V, D, isHotColdLog>::FindEntry(K
   return nullptr; // NOT REACHED
 }
 
-template <class K, class V, class D, bool isHotColdLog>
-inline AtomicHashBucketEntry* FasterKv<K, V, D, isHotColdLog>::FindTentativeEntry(KeyHash hash,
+template <class K, class V, class D, bool isHotColdLog, bool isTwoLevelHashTable>
+inline AtomicHashBucketEntry* FasterKv<K, V, D, isHotColdLog, isTwoLevelHashTable>::FindTentativeEntry(KeyHash hash,
     HashBucket* bucket,
     uint8_t version, HashBucketEntry& expected_entry) {
   expected_entry = HashBucketEntry::kInvalidEntry;
@@ -545,8 +581,8 @@ inline AtomicHashBucketEntry* FasterKv<K, V, D, isHotColdLog>::FindTentativeEntr
   return nullptr; // NOT REACHED
 }
 
-template <class K, class V, class D, bool isHotColdLog>
-bool FasterKv<K, V, D, isHotColdLog>::HasConflictingEntry(KeyHash hash, const HashBucket* bucket, uint8_t version,
+template <class K, class V, class D, bool isHotColdLog, bool isTwoLevelHashTable>
+bool FasterKv<K, V, D, isHotColdLog, isTwoLevelHashTable>::HasConflictingEntry(KeyHash hash, const HashBucket* bucket, uint8_t version,
     const AtomicHashBucketEntry* atomic_entry) const {
   uint16_t tag = atomic_entry->load().tag();
   while(true) {
@@ -571,8 +607,8 @@ bool FasterKv<K, V, D, isHotColdLog>::HasConflictingEntry(KeyHash hash, const Ha
   }
 }
 
-template <class K, class V, class D, bool isHotColdLog>
-inline AtomicHashBucketEntry* FasterKv<K, V, D, isHotColdLog>::FindOrCreateEntry(KeyHash hash,
+template <class K, class V, class D, bool isHotColdLog, bool isTwoLevelHashTable>
+inline AtomicHashBucketEntry* FasterKv<K, V, D, isHotColdLog, isTwoLevelHashTable>::FindOrCreateEntry(KeyHash hash,
     HashBucketEntry& expected_entry) {
   // Truncate the hash to get a bucket page_index < state[version].size.
   const uint32_t version = resize_info_.version;
@@ -611,9 +647,9 @@ inline AtomicHashBucketEntry* FasterKv<K, V, D, isHotColdLog>::FindOrCreateEntry
   return nullptr; // NOT REACHED
 }
 
-template <class K, class V, class D, bool isHotColdLog>
+template <class K, class V, class D, bool isHotColdLog, bool isTwoLevelHashTable>
 template <class RC>
-inline Status FasterKv<K, V, D, isHotColdLog>::Read(RC& context, AsyncCallback callback,
+inline Status FasterKv<K, V, D, isHotColdLog, isTwoLevelHashTable>::Read(RC& context, AsyncCallback callback,
                                       uint64_t monotonic_serial_num) {
   typedef RC read_context_t;
   typedef PendingReadContext<RC> pending_read_context_t;
@@ -639,6 +675,9 @@ inline Status FasterKv<K, V, D, isHotColdLog>::Read(RC& context, AsyncCallback c
   } else if (internal_status == OperationStatus::NOT_FOUND_HOTLOG_TOMBSTONE) {
     assert(isHotColdLog);
     status = Status::NotFound;
+  } else if (internal_status == OperationStatus::TWO_LEVEL_HT_QUERY_ISSUED) {
+    assert(!isHotColdLog && isTwoLevelHashTable);
+    status = Status::Pending;
   } else {
     assert(internal_status == OperationStatus::RECORD_ON_DISK);
     bool async;
@@ -658,9 +697,9 @@ inline Status FasterKv<K, V, D, isHotColdLog>::Read(RC& context, AsyncCallback c
   return status;
 }
 
-template <class K, class V, class D, bool isHotColdLog>
+template <class K, class V, class D, bool isHotColdLog, bool isTwoLevelHashTable>
 template <class UC>
-inline Status FasterKv<K, V, D, isHotColdLog>::Upsert(UC& context, AsyncCallback callback,
+inline Status FasterKv<K, V, D, isHotColdLog, isTwoLevelHashTable>::Upsert(UC& context, AsyncCallback callback,
                                         uint64_t monotonic_serial_num) {
   typedef UC upsert_context_t;
   typedef PendingUpsertContext<UC> pending_upsert_context_t;
@@ -675,6 +714,8 @@ inline Status FasterKv<K, V, D, isHotColdLog>::Upsert(UC& context, AsyncCallback
 
   if(internal_status == OperationStatus::SUCCESS) {
     status = Status::Ok;
+  } else if (internal_status == OperationStatus::TWO_LEVEL_HT_QUERY_ISSUED) {
+    status = Status::Pending;
   } else {
     bool async;
     status = HandleOperationStatus(thread_ctx(), pending_context, internal_status, async);
@@ -683,9 +724,9 @@ inline Status FasterKv<K, V, D, isHotColdLog>::Upsert(UC& context, AsyncCallback
   return status;
 }
 
-template <class K, class V, class D, bool isHotColdLog>
+template <class K, class V, class D, bool isHotColdLog, bool isTwoLevelHashTable>
 template <class MC>
-inline Status FasterKv<K, V, D, isHotColdLog>::Rmw(MC& context, AsyncCallback callback,
+inline Status FasterKv<K, V, D, isHotColdLog, isTwoLevelHashTable>::Rmw(MC& context, AsyncCallback callback,
                                      uint64_t monotonic_serial_num) {
   typedef MC rmw_context_t;
   typedef PendingRmwContext<MC> pending_rmw_context_t;
@@ -709,9 +750,9 @@ inline Status FasterKv<K, V, D, isHotColdLog>::Rmw(MC& context, AsyncCallback ca
   return status;
 }
 
-template <class K, class V, class D, bool isHotColdLog>
+template <class K, class V, class D, bool isHotColdLog, bool isTwoLevelHashTable>
 template <class DC>
-inline Status FasterKv<K, V, D, isHotColdLog>::Delete(DC& context, AsyncCallback callback,
+inline Status FasterKv<K, V, D, isHotColdLog, isTwoLevelHashTable>::Delete(DC& context, AsyncCallback callback,
                                         uint64_t monotonic_serial_num) {
   typedef DC delete_context_t;
   typedef PendingDeleteContext<DC> pending_delete_context_t;
@@ -727,6 +768,8 @@ inline Status FasterKv<K, V, D, isHotColdLog>::Delete(DC& context, AsyncCallback
     status = Status::Ok;
   } else if(internal_status == OperationStatus::NOT_FOUND) {
     status = Status::NotFound;
+  } else if (internal_status == OperationStatus::TWO_LEVEL_HT_QUERY_ISSUED) {
+    return Status::Pending;
   } else {
     bool async;
     status = HandleOperationStatus(thread_ctx(), pending_context, internal_status, async);
@@ -735,35 +778,60 @@ inline Status FasterKv<K, V, D, isHotColdLog>::Delete(DC& context, AsyncCallback
   return status;
 }
 
-template <class K, class V, class D, bool isHotColdLog>
-inline bool FasterKv<K, V, D, isHotColdLog>::CompletePending(bool wait) {
+template <class K, class V, class D, bool isHotColdLog, bool isTwoLevelHashTable>
+inline bool FasterKv<K, V, D, isHotColdLog, isTwoLevelHashTable>::CompletePending(bool wait) {
+  bool reallyDone = false;
   do {
-    disk.TryComplete();
+      if (isHotColdLog) {
+        cold_faster_->CompletePending(wait);
+      }
+      if (!isHotColdLog && isTwoLevelHashTable) {
+        disk_ht_->CompletePending(wait);
+      }
+      reallyDone = false;
+      do {
+        disk.TryComplete();
 
-    bool done = true;
-    if(thread_ctx().phase != Phase::WAIT_PENDING && thread_ctx().phase != Phase::IN_PROGRESS) {
-      CompleteIoPendingRequests(thread_ctx());
-    }
-    Refresh();
-    CompleteRetryRequests(thread_ctx());
+        bool done = true;
+        if(thread_ctx().phase != Phase::WAIT_PENDING && thread_ctx().phase != Phase::IN_PROGRESS) {
+          CompleteIoPendingRequests(thread_ctx());
+        }
+        Refresh();
+        CompleteRetryRequests(thread_ctx());
 
-    done = (thread_ctx().pending_ios.empty() && thread_ctx().retry_requests.empty());
+        done = (thread_ctx().pending_ios.empty() && thread_ctx().retry_requests.empty());
 
-    if(thread_ctx().phase != Phase::REST) {
-      CompleteIoPendingRequests(prev_thread_ctx());
-      Refresh();
-      CompleteRetryRequests(prev_thread_ctx());
-      done = false;
-    }
-    if(done) {
-      return true;
-    }
-  } while(wait);
-  return false;
+        if(thread_ctx().phase != Phase::REST) {
+          CompleteIoPendingRequests(prev_thread_ctx());
+          Refresh();
+          CompleteRetryRequests(prev_thread_ctx());
+          done = false;
+        }
+        if(done) {
+          reallyDone = true;
+          break;
+        }
+      } while(wait);
+      // If wait == true, we are not done yet, until cold_faster and disk_ht are also done.
+      // Note that tasks in cold_faster and disk_ht can create new tasks for us,
+      // so we must use a while loop to repeatedly check.
+      //
+      if (isHotColdLog) {
+        bool coldFasterDone = cold_faster_->thread_ctx().pending_ios.empty() && cold_faster_->thread_ctx().retry_requests.empty();
+        if (isTwoLevelHashTable) {
+          coldFasterDone &= cold_faster_->disk_ht_->thread_ctx().pending_ios.empty() && cold_faster_->disk_ht_->thread_ctx().retry_requests.empty();
+        }
+        reallyDone = coldFasterDone;
+      }
+      else if (isTwoLevelHashTable) {
+        reallyDone = disk_ht_->thread_ctx().pending_ios.empty() && disk_ht_->thread_ctx().retry_requests.empty();
+      }
+  } while (wait && !reallyDone);
+  return reallyDone;
 }
 
-template <class K, class V, class D, bool isHotColdLog>
-inline void FasterKv<K, V, D, isHotColdLog>::CompleteIoPendingRequests(ExecutionContext& context) {
+template <class K, class V, class D, bool isHotColdLog, bool isTwoLevelHashTable>
+inline void FasterKv<K, V, D, isHotColdLog, isTwoLevelHashTable>::CompleteIoPendingRequests(ExecutionContext& context) {
   AsyncIOContext* ctxt;
   // Clear this thread's I/O response queue. (Does not clear I/Os issued by this thread that have
   // not yet completed.)
@@ -790,7 +858,7 @@ inline void FasterKv<K, V, D, isHotColdLog>::CompleteIoPendingRequests(Execution
       if(pending_context->type == OperationType::Read) {
         if (isHotColdLog && !pending_context->is_special_address_query) {
           WrappedAsyncPendingReadContext<K, V> wctxt(static_cast<async_pending_read_context_t*>(pending_context.get()));
-          result = cold_faster_->Read(wctxt, pending_context->caller_callback, thread_ctx().serial_num);
+          result = cold_faster_->Read(wctxt, wctxt.wrapped_caller_callback, thread_ctx().serial_num);
           assert(result == Status::Ok || result == Status::NotFound || result == Status::Pending);
           pending_context.async = (result == Status::Pending);
         } else {
@@ -815,7 +883,7 @@ inline void FasterKv<K, V, D, isHotColdLog>::CompleteIoPendingRequests(Execution
           if (!pending_context->is_special_address_query) {
             assert(!pending_context.async);
             WrappedAsyncPendingReadContext<K, V> wctxt(static_cast<async_pending_read_context_t*>(pending_context.get()));
-            result = cold_faster_->Read(wctxt, pending_context->caller_callback, thread_ctx().serial_num);
+            result = cold_faster_->Read(wctxt, wctxt.wrapped_caller_callback, thread_ctx().serial_num);
             assert(result == Status::Ok || result == Status::NotFound || result == Status::Pending);
             pending_context.async = (result == Status::Pending);
           } else {
@@ -834,8 +902,8 @@ inline void FasterKv<K, V, D, isHotColdLog>::CompleteIoPendingRequests(Execution
   }
 }
 
-template <class K, class V, class D, bool isHotColdLog>
-inline void FasterKv<K, V, D, isHotColdLog>::CompleteRetryRequests(ExecutionContext& context) {
+template <class K, class V, class D, bool isHotColdLog, bool isTwoLevelHashTable>
+inline void FasterKv<K, V, D, isHotColdLog, isTwoLevelHashTable>::CompleteRetryRequests(ExecutionContext& context) {
   // If we can't complete a request, it will be pushed back onto the deque. Retry each request
   // only once.
   size_t size = context.retry_requests.size();
@@ -873,9 +941,9 @@ inline void FasterKv<K, V, D, isHotColdLog>::CompleteRetryRequests(ExecutionCont
   }
 }
 
-template <class K, class V, class D, bool isHotColdLog>
+template <class K, class V, class D, bool isHotColdLog, bool isTwoLevelHashTable>
 template <class C>
-inline OperationStatus FasterKv<K, V, D, isHotColdLog>::InternalRead(C& pending_context) const {
+inline OperationStatus FasterKv<K, V, D, isHotColdLog, isTwoLevelHashTable>::InternalRead(C& pending_context) const {
   typedef C pending_read_context_t;
 
   if(thread_ctx().phase != Phase::REST) {
@@ -884,8 +952,54 @@ inline OperationStatus FasterKv<K, V, D, isHotColdLog>::InternalRead(C& pending_
 
   KeyHash hash = pending_context.get_key_hash();
   HashBucketEntry entry;
-  const AtomicHashBucketEntry* atomic_entry = FindEntry(hash, entry);
-  if(!atomic_entry) {
+  const AtomicHashBucketEntry* atomic_entry;
+  if (!isHotColdLog && isTwoLevelHashTable)
+  {
+    auto retryFn = [this](WrappedAsyncPendingReadContext<K, V>* ctxt, Status status)
+    {
+      if (status == Status::NotFound) {
+        ctxt->wrapped_caller_callback(ctxt, status);
+      }
+      else {
+        assert(status == Status::Ok);
+        status = const_cast<faster_t*>(this)->Read(*ctxt, ctxt->wrapped_caller_callback, 1);
+        if (status != Status::Pending) {
+          ctxt->wrapped_caller_callback(ctxt, status);
+        }
+      }
+    };
+    IAsyncContext* copy_;
+    pending_context.DeepCopy(copy_);
+    async_pending_read_context_t* copy = static_cast<async_pending_read_context_t*>(copy_);
+    WrappedAsyncPendingReadContext<K, V> readCtxt(copy);
+    // TODO: this doesn't work with hash table resizing
+    WrappedRmwContextForTwoLevelHt<K, V, WrappedAsyncPendingReadContext<K, V>> htCtxt(
+                state_[resize_info_.version].size(), hash.GetControl(), &readCtxt, retryFn, &entry, const_cast<AtomicHashBucketEntry**>(&atomic_entry));
+    auto cb = [](IAsyncContext* ctxtTmp, Status status)
+    {
+        WrappedRmwContextForTwoLevelHt<K, V, WrappedAsyncPendingReadContext<K, V>>* ctxt =
+                static_cast<WrappedRmwContextForTwoLevelHt<K, V, WrappedAsyncPendingReadContext<K, V>>*>(ctxtTmp);
+        ctxt->retry_(ctxt->ctxt_, status);
+    };
+    Status status = disk_ht_->Rmw(htCtxt, cb, 1);
+    if (status != Status::Pending)
+    {
+      assert(status == Status::Ok);
+      if (entry == HashBucketEntry::kInvalidEntry)
+      {
+          atomic_entry = nullptr;
+      }
+    }
+    else
+    {
+      return OperationStatus::TWO_LEVEL_HT_QUERY_ISSUED;
+    }
+  }
+  else
+  {
+    atomic_entry = FindEntry(hash, entry);
+  }
+  if(atomic_entry == nullptr) {
     // no record found
     return OperationStatus::NOT_FOUND;
   }
@@ -983,18 +1097,59 @@ inline OperationStatus FasterKv<K, V, D, isHotColdLog>::InternalRead(C& pending_
   }
 }
 
-template <class K, class V, class D, bool isHotColdLog>
+template <class K, class V, class D, bool isHotColdLog, bool isTwoLevelHashTable>
 template <class C>
-inline OperationStatus FasterKv<K, V, D, isHotColdLog>::InternalUpsert(C& pending_context) {
+inline OperationStatus FasterKv<K, V, D, isHotColdLog, isTwoLevelHashTable>::InternalUpsert(C& pending_context) {
   typedef C pending_upsert_context_t;
 
   if(thread_ctx().phase != Phase::REST) {
     HeavyEnter();
   }
 
+  auto retryFn = [this](WrappedAsyncPendingUpsertContext<K, V>* ctxt, Status status)
+  {
+    if (status == Status::NotFound) {
+      ctxt->wrapped_caller_callback(ctxt, status);
+    }
+    else {
+      assert(status == Status::Ok);
+      status = Upsert(*ctxt, ctxt->wrapped_caller_callback, 1);
+      if (status != Status::Pending) {
+        ctxt->wrapped_caller_callback(ctxt, status);
+      }
+    }
+  };
+
   KeyHash hash = pending_context.get_key_hash();
   HashBucketEntry expected_entry;
-  AtomicHashBucketEntry* atomic_entry = FindOrCreateEntry(hash, expected_entry);
+  AtomicHashBucketEntry* atomic_entry;
+  if (!isHotColdLog && isTwoLevelHashTable)
+  {
+    WrappedAsyncPendingUpsertContext<K, V> upsertCtxt(&pending_context);
+    // TODO: this doesn't work with hash table resizing
+    WrappedRmwContextForTwoLevelHt<K, V, WrappedAsyncPendingUpsertContext<K, V>> htCtxt(
+                state_[resize_info_.version].size(), hash.GetControl(),
+            &upsertCtxt, retryFn, &expected_entry, &atomic_entry);
+    auto cb = [](IAsyncContext* ctxtTmp, Status status)
+    {
+        WrappedRmwContextForTwoLevelHt<K, V, WrappedAsyncPendingUpsertContext<K, V>>* ctxt =
+                static_cast<WrappedRmwContextForTwoLevelHt<K, V, WrappedAsyncPendingUpsertContext<K, V>>*>(ctxtTmp);
+        ctxt->retry_(ctxt->ctxt_, status);
+    };
+    Status status = disk_ht_->Rmw(htCtxt, cb, 1);
+    if (status == Status::Pending)
+    {
+      return OperationStatus::TWO_LEVEL_HT_QUERY_ISSUED;
+    }
+    else
+    {
+        assert(status == Status::Ok);
+    }
+  }
+  else
+  {
+    atomic_entry = FindOrCreateEntry(hash, expected_entry);
+  }
 
   // (Note that address will be Address::kInvalidAddress, if the atomic_entry was created.)
   Address address = expected_entry.address();
@@ -1081,6 +1236,11 @@ inline OperationStatus FasterKv<K, V, D, isHotColdLog>::InternalUpsert(C& pendin
 
   if(address >= read_only_address) {
     // Mutable region; try to update in place.
+    // The load for two-level hash table should still be safe here:
+    // In the RMW we have moved the hash table bucket to mutable region (>= read_only_address),
+    // and we never call Refresh() between the RMW above and here, so it should still be in mutable region.
+    // Same for the access below.
+    //
     if(atomic_entry->load() != expected_entry) {
       // Some other thread may have RCUed the record before we locked it; try again.
       return OperationStatus::RETRY_NOW;
@@ -1121,9 +1281,9 @@ create_record:
   }
 }
 
-template <class K, class V, class D, bool isHotColdLog>
+template <class K, class V, class D, bool isHotColdLog, bool isTwoLevelHashTable>
 template <class C>
-inline OperationStatus FasterKv<K, V, D, isHotColdLog>::InternalRmw(C& pending_context, bool retrying) {
+inline OperationStatus FasterKv<K, V, D, isHotColdLog, isTwoLevelHashTable>::InternalRmw(C& pending_context, bool retrying) {
   typedef C pending_rmw_context_t;
 
   Phase phase = retrying ? pending_context.phase : thread_ctx().phase;
@@ -1353,8 +1513,8 @@ create_record:
   }
 }
 
-template <class K, class V, class D, bool isHotColdLog>
-inline OperationStatus FasterKv<K, V, D, isHotColdLog>::InternalRetryPendingRmw(
+template <class K, class V, class D, bool isHotColdLog, bool isTwoLevelHashTable>
+inline OperationStatus FasterKv<K, V, D, isHotColdLog, isTwoLevelHashTable>::InternalRetryPendingRmw(
   async_pending_rmw_context_t& pending_context) {
   OperationStatus status = InternalRmw(pending_context, true);
   if(status == OperationStatus::SUCCESS && pending_context.version != thread_ctx().version) {
@@ -1363,9 +1523,9 @@ inline OperationStatus FasterKv<K, V, D, isHotColdLog>::InternalRetryPendingRmw(
   return status;
 }
 
-template <class K, class V, class D, bool isHotColdLog>
+template <class K, class V, class D, bool isHotColdLog, bool isTwoLevelHashTable>
 template<class C>
-inline OperationStatus FasterKv<K, V, D, isHotColdLog>::InternalDelete(C& pending_context) {
+inline OperationStatus FasterKv<K, V, D, isHotColdLog, isTwoLevelHashTable>::InternalDelete(C& pending_context) {
   typedef C pending_delete_context_t;
 
   if(thread_ctx().phase != Phase::REST) {
@@ -1374,13 +1534,58 @@ inline OperationStatus FasterKv<K, V, D, isHotColdLog>::InternalDelete(C& pendin
 
   KeyHash hash = pending_context.get_key_hash();
   HashBucketEntry expected_entry;
-  AtomicHashBucketEntry* atomic_entry = const_cast<AtomicHashBucketEntry*>(FindEntry(hash, expected_entry));
+  AtomicHashBucketEntry* atomic_entry;
+
+  auto retryFn = [this](WrappedAsyncPendingDeleteContext<K, V>* ctxt, Status status)
+  {
+    if (status == Status::NotFound) {
+      ctxt->wrapped_caller_callback(ctxt, status);
+    }
+    else {
+      assert(status == Status::Ok);
+      status = Delete(*ctxt, ctxt->wrapped_caller_callback, 1);
+      if (status != Status::Pending) {
+        ctxt->wrapped_caller_callback(ctxt, status);
+      }
+    }
+  };
+
+  if (!isHotColdLog && isTwoLevelHashTable)
+  {
+    WrappedAsyncPendingDeleteContext<K, V> deleteCtxt(&pending_context);
+    // TODO: this doesn't work with hash table resizing
+    WrappedRmwContextForTwoLevelHt<K, V, WrappedAsyncPendingDeleteContext<K, V>> htCtxt(
+                state_[resize_info_.version].size(), hash.GetControl(),
+            &deleteCtxt, retryFn, &expected_entry, &atomic_entry);
+    auto cb = [](IAsyncContext* ctxtTmp, Status status)
+    {
+        WrappedRmwContextForTwoLevelHt<K, V, WrappedAsyncPendingDeleteContext<K, V>>* ctxt =
+                static_cast<WrappedRmwContextForTwoLevelHt<K, V, WrappedAsyncPendingDeleteContext<K, V>>*>(ctxtTmp);
+        ctxt->retry_(ctxt->ctxt_, status);
+    };
+    Status status = disk_ht_->Rmw(htCtxt, cb, 1);
+    if (status == Status::Pending)
+    {
+      return OperationStatus::TWO_LEVEL_HT_QUERY_ISSUED;
+    }
+    else
+    {
+        assert(status == Status::Ok);
+        if (expected_entry == HashBucketEntry::kInvalidEntry) {
+            atomic_entry = nullptr;
+        }
+    }
+  }
+  else
+  {
+    atomic_entry = const_cast<AtomicHashBucketEntry*>(FindEntry(hash, expected_entry));
+  }
 
   if(!atomic_entry) {
     // no record found
     if (isHotColdLog) {
       WrappedAsyncPendingDeleteContext<K, V> ctxt(&pending_context);
-      Status r = cold_faster_->Delete(ctxt, pending_context.caller_callback, thread_ctx().serial_num);
+      Status r = cold_faster_->Delete(ctxt, ctxt.wrapped_caller_callback, thread_ctx().serial_num);
       assert(r == Status::Pending || r == Status::NotFound || r == Status::Ok);
       if (r == Status::Pending) {
         return OperationStatus::COLD_LOG_QUERY_ISSUED;
@@ -1504,9 +1709,9 @@ create_record:
   }
 }
 
-template <class K, class V, class D, bool isHotColdLog>
+template <class K, class V, class D, bool isHotColdLog, bool isTwoLevelHashTable>
 template<class C>
-inline Address FasterKv<K, V, D, isHotColdLog>::TraceBackForKeyMatchCtxt(const C& ctxt, Address from_address,
+inline Address FasterKv<K, V, D, isHotColdLog, isTwoLevelHashTable>::TraceBackForKeyMatchCtxt(const C& ctxt, Address from_address,
     Address min_offset) const {
   while(from_address >= min_offset) {
     const record_t* record = reinterpret_cast<const record_t*>(hlog.Get(from_address));
@@ -1520,8 +1725,8 @@ inline Address FasterKv<K, V, D, isHotColdLog>::TraceBackForKeyMatchCtxt(const C
   return from_address;
 }
 
-template <class K, class V, class D, bool isHotColdLog>
-inline Address FasterKv<K, V, D, isHotColdLog>::TraceBackForKeyMatch(const key_t& key, Address from_address,
+template <class K, class V, class D, bool isHotColdLog, bool isTwoLevelHashTable>
+inline Address FasterKv<K, V, D, isHotColdLog, isTwoLevelHashTable>::TraceBackForKeyMatch(const key_t& key, Address from_address,
                                                        Address min_offset) const {
   while(from_address >= min_offset) {
     const record_t* record = reinterpret_cast<const record_t*>(hlog.Get(from_address));
@@ -1535,8 +1740,8 @@ inline Address FasterKv<K, V, D, isHotColdLog>::TraceBackForKeyMatch(const key_t
   return from_address;
 }
 
-template <class K, class V, class D, bool isHotColdLog>
-inline Status FasterKv<K, V, D, isHotColdLog>::HandleOperationStatus(ExecutionContext& ctx,
+template <class K, class V, class D, bool isHotColdLog, bool isTwoLevelHashTable>
+inline Status FasterKv<K, V, D, isHotColdLog, isTwoLevelHashTable>::HandleOperationStatus(ExecutionContext& ctx,
     pending_context_t& pending_context, OperationStatus internal_status, bool& async) {
   async = false;
   switch(internal_status) {
@@ -1574,6 +1779,9 @@ inline Status FasterKv<K, V, D, isHotColdLog>::HandleOperationStatus(ExecutionCo
       return Status::NotFound;
     } else if (internal_status == OperationStatus::NOT_FOUND_HOTLOG_TOMBSTONE) {
       return Status::NotFoundHotLogTombstone;
+    } else if (internal_status == OperationStatus::TWO_LEVEL_HT_QUERY_ISSUED) {
+      async = true;
+      return Status::Pending;
     } else {
       return HandleOperationStatus(ctx, pending_context, internal_status, async);
     }
@@ -1613,8 +1821,8 @@ inline Status FasterKv<K, V, D, isHotColdLog>::HandleOperationStatus(ExecutionCo
   return Status::Corruption;
 }
 
-template <class K, class V, class D, bool isHotColdLog>
-inline Status FasterKv<K, V, D, isHotColdLog>::PivotAndRetry(ExecutionContext& ctx,
+template <class K, class V, class D, bool isHotColdLog, bool isTwoLevelHashTable>
+inline Status FasterKv<K, V, D, isHotColdLog, isTwoLevelHashTable>::PivotAndRetry(ExecutionContext& ctx,
     pending_context_t& pending_context, bool& async) {
   // Some invariants
   assert(ctx.version == thread_ctx().version);
@@ -1628,8 +1836,8 @@ inline Status FasterKv<K, V, D, isHotColdLog>::PivotAndRetry(ExecutionContext& c
   return HandleOperationStatus(thread_ctx(), pending_context, OperationStatus::RETRY_NOW, async);
 }
 
-template <class K, class V, class D, bool isHotColdLog>
-inline Status FasterKv<K, V, D, isHotColdLog>::RetryLater(ExecutionContext& ctx,
+template <class K, class V, class D, bool isHotColdLog, bool isTwoLevelHashTable>
+inline Status FasterKv<K, V, D, isHotColdLog, isTwoLevelHashTable>::RetryLater(ExecutionContext& ctx,
     pending_context_t& pending_context, bool& async) {
   IAsyncContext* context_copy;
   Status result = pending_context.DeepCopy(context_copy);
@@ -1643,15 +1851,15 @@ inline Status FasterKv<K, V, D, isHotColdLog>::RetryLater(ExecutionContext& ctx,
   }
 }
 
-template <class K, class V, class D, bool isHotColdLog>
-inline constexpr uint32_t FasterKv<K, V, D, isHotColdLog>::MinIoRequestSize() const {
+template <class K, class V, class D, bool isHotColdLog, bool isTwoLevelHashTable>
+inline constexpr uint32_t FasterKv<K, V, D, isHotColdLog, isTwoLevelHashTable>::MinIoRequestSize() const {
   return static_cast<uint32_t>(
            sizeof(value_t) + pad_alignment(record_t::min_disk_key_size(),
                alignof(value_t)));
 }
 
-template <class K, class V, class D, bool isHotColdLog>
-inline Status FasterKv<K, V, D, isHotColdLog>::IssueAsyncIoRequest(ExecutionContext& ctx,
+template <class K, class V, class D, bool isHotColdLog, bool isTwoLevelHashTable>
+inline Status FasterKv<K, V, D, isHotColdLog, isTwoLevelHashTable>::IssueAsyncIoRequest(ExecutionContext& ctx,
     pending_context_t& pending_context, bool& async) {
   // Issue asynchronous I/O request
   uint64_t io_id = thread_ctx().io_id++;
@@ -1664,8 +1872,8 @@ inline Status FasterKv<K, V, D, isHotColdLog>::IssueAsyncIoRequest(ExecutionCont
   return Status::Pending;
 }
 
-template <class K, class V, class D, bool isHotColdLog>
-inline Address FasterKv<K, V, D, isHotColdLog>::BlockAllocate(uint32_t record_size) {
+template <class K, class V, class D, bool isHotColdLog, bool isTwoLevelHashTable>
+inline Address FasterKv<K, V, D, isHotColdLog, isTwoLevelHashTable>::BlockAllocate(uint32_t record_size) {
   uint32_t page;
   Address retval = hlog.Allocate(record_size, page);
   while(retval < hlog.read_only_address.load()) {
@@ -1681,8 +1889,8 @@ inline Address FasterKv<K, V, D, isHotColdLog>::BlockAllocate(uint32_t record_si
   return retval;
 }
 
-template <class K, class V, class D, bool isHotColdLog>
-void FasterKv<K, V, D, isHotColdLog>::AsyncGetFromDisk(Address address, uint32_t num_records,
+template <class K, class V, class D, bool isHotColdLog, bool isTwoLevelHashTable>
+void FasterKv<K, V, D, isHotColdLog, isTwoLevelHashTable>::AsyncGetFromDisk(Address address, uint32_t num_records,
     AsyncIOCallback callback, AsyncIOContext& context) {
   if(epoch_.IsProtected()) {
     /// Throttling. (Thread pool, unprotected threads are not throttled.)
@@ -1696,8 +1904,8 @@ void FasterKv<K, V, D, isHotColdLog>::AsyncGetFromDisk(Address address, uint32_t
   hlog.AsyncGetFromDisk(address, num_records, callback, context);
 }
 
-template <class K, class V, class D, bool isHotColdLog>
-void FasterKv<K, V, D, isHotColdLog>::AsyncGetFromDiskCallback(IAsyncContext* ctxt, Status result,
+template <class K, class V, class D, bool isHotColdLog, bool isTwoLevelHashTable>
+void FasterKv<K, V, D, isHotColdLog, isTwoLevelHashTable>::AsyncGetFromDiskCallback(IAsyncContext* ctxt, Status result,
     size_t bytes_transferred) {
   CallbackContext<AsyncIOContext> context{ ctxt };
   faster_t* faster = reinterpret_cast<faster_t*>(context->faster);
@@ -1748,8 +1956,8 @@ void FasterKv<K, V, D, isHotColdLog>::AsyncGetFromDiskCallback(IAsyncContext* ct
   }
 }
 
-template <class K, class V, class D, bool isHotColdLog>
-OperationStatus FasterKv<K, V, D, isHotColdLog>::InternalContinuePendingRead(ExecutionContext& context,
+template <class K, class V, class D, bool isHotColdLog, bool isTwoLevelHashTable>
+OperationStatus FasterKv<K, V, D, isHotColdLog, isTwoLevelHashTable>::InternalContinuePendingRead(ExecutionContext& context,
     AsyncIOContext& io_context) {
   if(io_context.address >= hlog.begin_address.load()) {
     async_pending_read_context_t* pending_context = static_cast<async_pending_read_context_t*>(
@@ -1785,8 +1993,8 @@ OperationStatus FasterKv<K, V, D, isHotColdLog>::InternalContinuePendingRead(Exe
   }
 }
 
-template <class K, class V, class D, bool isHotColdLog>
-bool FasterKv<K, V, D, isHotColdLog>::RmwIssueColdLogQuery(
+template <class K, class V, class D, bool isHotColdLog, bool isTwoLevelHashTable>
+bool FasterKv<K, V, D, isHotColdLog, isTwoLevelHashTable>::RmwIssueColdLogQuery(
     ExecutionContext& context,
     async_pending_rmw_context_t* pending_context)
 {
@@ -1837,8 +2045,8 @@ bool FasterKv<K, V, D, isHotColdLog>::RmwIssueColdLogQuery(
   return readCtxt.isDone;
 }
 
-template <class K, class V, class D, bool isHotColdLog>
-OperationStatus FasterKv<K, V, D, isHotColdLog>::InternalContinuePendingRmwInternal(
+template <class K, class V, class D, bool isHotColdLog, bool isTwoLevelHashTable>
+OperationStatus FasterKv<K, V, D, isHotColdLog, isTwoLevelHashTable>::InternalContinuePendingRmwInternal(
     ExecutionContext& context,
     async_pending_rmw_context_t* pending_context,
     bool fromIoContext,
@@ -1947,8 +2155,8 @@ OperationStatus FasterKv<K, V, D, isHotColdLog>::InternalContinuePendingRmwInter
   }
 }
 
-template <class K, class V, class D, bool isHotColdLog>
-OperationStatus FasterKv<K, V, D, isHotColdLog>::InternalContinuePendingRmw(
+template <class K, class V, class D, bool isHotColdLog, bool isTwoLevelHashTable>
+OperationStatus FasterKv<K, V, D, isHotColdLog, isTwoLevelHashTable>::InternalContinuePendingRmw(
     ExecutionContext& context, AsyncIOContext& io_context)
 {
   async_pending_rmw_context_t* pending_context = static_cast<async_pending_rmw_context_t*>(
@@ -1959,15 +2167,15 @@ OperationStatus FasterKv<K, V, D, isHotColdLog>::InternalContinuePendingRmw(
                                             io_context.address, disk_record, nullptr /*disk_value*/);
 }
 
-template <class K, class V, class D, bool isHotColdLog>
-void FasterKv<K, V, D, isHotColdLog>::InitializeCheckpointLocks() {
+template <class K, class V, class D, bool isHotColdLog, bool isTwoLevelHashTable>
+void FasterKv<K, V, D, isHotColdLog, isTwoLevelHashTable>::InitializeCheckpointLocks() {
   uint32_t table_version = resize_info_.version;
   uint64_t size = state_[table_version].size();
   checkpoint_locks_.Initialize(size);
 }
 
-template <class K, class V, class D, bool isHotColdLog>
-Status FasterKv<K, V, D, isHotColdLog>::WriteIndexMetadata() {
+template <class K, class V, class D, bool isHotColdLog, bool isTwoLevelHashTable>
+Status FasterKv<K, V, D, isHotColdLog, isTwoLevelHashTable>::WriteIndexMetadata() {
   std::string filename = disk.index_checkpoint_path(checkpoint_.index_token) + "info.dat";
   // (This code will need to be refactored into the disk_t interface, if we want to support
   // unformatted disks.)
@@ -1985,8 +2193,8 @@ Status FasterKv<K, V, D, isHotColdLog>::WriteIndexMetadata() {
   return Status::Ok;
 }
 
-template <class K, class V, class D, bool isHotColdLog>
-Status FasterKv<K, V, D, isHotColdLog>::ReadIndexMetadata(const Guid& token) {
+template <class K, class V, class D, bool isHotColdLog, bool isTwoLevelHashTable>
+Status FasterKv<K, V, D, isHotColdLog, isTwoLevelHashTable>::ReadIndexMetadata(const Guid& token) {
   std::string filename = disk.index_checkpoint_path(token) + "info.dat";
   // (This code will need to be refactored into the disk_t interface, if we want to support
   // unformatted disks.)
@@ -2004,8 +2212,8 @@ Status FasterKv<K, V, D, isHotColdLog>::ReadIndexMetadata(const Guid& token) {
   return Status::Ok;
 }
 
-template <class K, class V, class D, bool isHotColdLog>
-Status FasterKv<K, V, D, isHotColdLog>::WriteCprMetadata() {
+template <class K, class V, class D, bool isHotColdLog, bool isTwoLevelHashTable>
+Status FasterKv<K, V, D, isHotColdLog, isTwoLevelHashTable>::WriteCprMetadata() {
   std::string filename = disk.cpr_checkpoint_path(checkpoint_.hybrid_log_token) + "info.dat";
   // (This code will need to be refactored into the disk_t interface, if we want to support
   // unformatted disks.)
@@ -2023,8 +2231,8 @@ Status FasterKv<K, V, D, isHotColdLog>::WriteCprMetadata() {
   return Status::Ok;
 }
 
-template <class K, class V, class D, bool isHotColdLog>
-Status FasterKv<K, V, D, isHotColdLog>::ReadCprMetadata(const Guid& token) {
+template <class K, class V, class D, bool isHotColdLog, bool isTwoLevelHashTable>
+Status FasterKv<K, V, D, isHotColdLog, isTwoLevelHashTable>::ReadCprMetadata(const Guid& token) {
   std::string filename = disk.cpr_checkpoint_path(token) + "info.dat";
   // (This code will need to be refactored into the disk_t interface, if we want to support
   // unformatted disks.)
@@ -2042,8 +2250,8 @@ Status FasterKv<K, V, D, isHotColdLog>::ReadCprMetadata(const Guid& token) {
   return Status::Ok;
 }
 
-template <class K, class V, class D, bool isHotColdLog>
-Status FasterKv<K, V, D, isHotColdLog>::WriteCprContext() {
+template <class K, class V, class D, bool isHotColdLog, bool isTwoLevelHashTable>
+Status FasterKv<K, V, D, isHotColdLog, isTwoLevelHashTable>::WriteCprContext() {
   std::string filename = disk.cpr_checkpoint_path(checkpoint_.hybrid_log_token);
   const Guid& guid = prev_thread_ctx().guid;
   filename += guid.ToString();
@@ -2065,8 +2273,8 @@ Status FasterKv<K, V, D, isHotColdLog>::WriteCprContext() {
   return Status::Ok;
 }
 
-template <class K, class V, class D, bool isHotColdLog>
-Status FasterKv<K, V, D, isHotColdLog>::ReadCprContexts(const Guid& token, const Guid* guids) {
+template <class K, class V, class D, bool isHotColdLog, bool isTwoLevelHashTable>
+Status FasterKv<K, V, D, isHotColdLog, isTwoLevelHashTable>::ReadCprContexts(const Guid& token, const Guid* guids) {
   for(size_t idx = 0; idx < Thread::kMaxNumThreads; ++idx) {
     const Guid& guid = guids[idx];
     if(guid == Guid{}) {
@@ -2099,8 +2307,8 @@ Status FasterKv<K, V, D, isHotColdLog>::ReadCprContexts(const Guid& token, const
   }
 }
 
-template <class K, class V, class D, bool isHotColdLog>
-Status FasterKv<K, V, D, isHotColdLog>::CheckpointFuzzyIndex() {
+template <class K, class V, class D, bool isHotColdLog, bool isTwoLevelHashTable>
+Status FasterKv<K, V, D, isHotColdLog, isTwoLevelHashTable>::CheckpointFuzzyIndex() {
   uint32_t hash_table_version = resize_info_.version;
   // Checkpoint the main hash table.
   file_t ht_file = disk.NewFile(disk.relative_index_checkpoint_path(checkpoint_.index_token) +
@@ -2118,8 +2326,8 @@ Status FasterKv<K, V, D, isHotColdLog>::CheckpointFuzzyIndex() {
   return Status::Ok;
 }
 
-template <class K, class V, class D, bool isHotColdLog>
-Status FasterKv<K, V, D, isHotColdLog>::CheckpointFuzzyIndexComplete() {
+template <class K, class V, class D, bool isHotColdLog, bool isTwoLevelHashTable>
+Status FasterKv<K, V, D, isHotColdLog, isTwoLevelHashTable>::CheckpointFuzzyIndexComplete() {
   if(!checkpoint_.index_checkpoint_started) {
     return Status::Pending;
   }
@@ -2134,8 +2342,8 @@ Status FasterKv<K, V, D, isHotColdLog>::CheckpointFuzzyIndexComplete() {
   }
 }
 
-template <class K, class V, class D, bool isHotColdLog>
-Status FasterKv<K, V, D, isHotColdLog>::RecoverFuzzyIndex() {
+template <class K, class V, class D, bool isHotColdLog, bool isTwoLevelHashTable>
+Status FasterKv<K, V, D, isHotColdLog, isTwoLevelHashTable>::RecoverFuzzyIndex() {
   uint8_t hash_table_version = resize_info_.version;
   assert(state_[hash_table_version].size() == checkpoint_.index_metadata.table_size);
 
@@ -2153,8 +2361,8 @@ Status FasterKv<K, V, D, isHotColdLog>::RecoverFuzzyIndex() {
          checkpoint_.index_metadata.num_ofb_bytes, checkpoint_.index_metadata.ofb_count);
 }
 
-template <class K, class V, class D, bool isHotColdLog>
-Status FasterKv<K, V, D, isHotColdLog>::RecoverFuzzyIndexComplete(bool wait) {
+template <class K, class V, class D, bool isHotColdLog, bool isTwoLevelHashTable>
+Status FasterKv<K, V, D, isHotColdLog, isTwoLevelHashTable>::RecoverFuzzyIndexComplete(bool wait) {
   uint8_t hash_table_version = resize_info_.version;
   Status result = state_[hash_table_version].RecoverComplete(true);
   if(result != Status::Ok) {
@@ -2187,8 +2395,8 @@ Status FasterKv<K, V, D, isHotColdLog>::RecoverFuzzyIndexComplete(bool wait) {
   return Status::Ok;
 }
 
-template <class K, class V, class D, bool isHotColdLog>
-Status FasterKv<K, V, D, isHotColdLog>::RecoverHybridLog() {
+template <class K, class V, class D, bool isHotColdLog, bool isTwoLevelHashTable>
+Status FasterKv<K, V, D, isHotColdLog, isTwoLevelHashTable>::RecoverHybridLog() {
   class Context : public IAsyncContext {
    public:
     Context(hlog_t& hlog_, uint32_t page_, RecoveryStatus& recovery_status_)
@@ -2258,8 +2466,8 @@ Status FasterKv<K, V, D, isHotColdLog>::RecoverHybridLog() {
   return Status::Ok;
 }
 
-template <class K, class V, class D, bool isHotColdLog>
-Status FasterKv<K, V, D, isHotColdLog>::RecoverHybridLogFromSnapshotFile() {
+template <class K, class V, class D, bool isHotColdLog, bool isTwoLevelHashTable>
+Status FasterKv<K, V, D, isHotColdLog, isTwoLevelHashTable>::RecoverHybridLogFromSnapshotFile() {
   class Context : public IAsyncContext {
    public:
     Context(hlog_t& hlog_, file_t& file_, uint32_t file_start_page_, uint32_t page_,
@@ -2348,8 +2556,8 @@ Status FasterKv<K, V, D, isHotColdLog>::RecoverHybridLogFromSnapshotFile() {
   return Status::Ok;
 }
 
-template <class K, class V, class D, bool isHotColdLog>
-Status FasterKv<K, V, D, isHotColdLog>::RecoverFromPage(Address from_address, Address to_address) {
+template <class K, class V, class D, bool isHotColdLog, bool isTwoLevelHashTable>
+Status FasterKv<K, V, D, isHotColdLog, isTwoLevelHashTable>::RecoverFromPage(Address from_address, Address to_address) {
   assert(from_address.page() == to_address.page());
   for(Address address = from_address; address < to_address;) {
     record_t* record = reinterpret_cast<record_t*>(hlog.Get(address));
@@ -2382,8 +2590,8 @@ Status FasterKv<K, V, D, isHotColdLog>::RecoverFromPage(Address from_address, Ad
   return Status::Ok;
 }
 
-template <class K, class V, class D, bool isHotColdLog>
-Status FasterKv<K, V, D, isHotColdLog>::RestoreHybridLog() {
+template <class K, class V, class D, bool isHotColdLog, bool isTwoLevelHashTable>
+Status FasterKv<K, V, D, isHotColdLog, isTwoLevelHashTable>::RestoreHybridLog() {
   Address tail_address = checkpoint_.log_metadata.final_address;
   uint32_t end_page = tail_address.offset() > 0 ? tail_address.page() + 1 : tail_address.page();
   uint32_t capacity = hlog.buffer_size();
@@ -2413,8 +2621,8 @@ Status FasterKv<K, V, D, isHotColdLog>::RestoreHybridLog() {
   return Status::Ok;
 }
 
-template <class K, class V, class D, bool isHotColdLog>
-void FasterKv<K, V, D, isHotColdLog>::HeavyEnter() {
+template <class K, class V, class D, bool isHotColdLog, bool isTwoLevelHashTable>
+void FasterKv<K, V, D, isHotColdLog, isTwoLevelHashTable>::HeavyEnter() {
   if(thread_ctx().phase == Phase::GC_IO_PENDING || thread_ctx().phase == Phase::GC_IN_PROGRESS) {
     CleanHashTableBuckets();
     return;
@@ -2430,8 +2638,8 @@ void FasterKv<K, V, D, isHotColdLog>::HeavyEnter() {
   }
 }
 
-template <class K, class V, class D, bool isHotColdLog>
-bool FasterKv<K, V, D, isHotColdLog>::CleanHashTableBuckets() {
+template <class K, class V, class D, bool isHotColdLog, bool isTwoLevelHashTable>
+bool FasterKv<K, V, D, isHotColdLog, isTwoLevelHashTable>::CleanHashTableBuckets() {
   uint64_t chunk = gc_.next_chunk++;
   if(chunk >= gc_.num_chunks) {
     // No chunk left to clean.
@@ -2473,8 +2681,8 @@ bool FasterKv<K, V, D, isHotColdLog>::CleanHashTableBuckets() {
   return true;
 }
 
-template <class K, class V, class D, bool isHotColdLog>
-void FasterKv<K, V, D, isHotColdLog>::AddHashEntry(HashBucket*& bucket, uint32_t& next_idx, uint8_t version,
+template <class K, class V, class D, bool isHotColdLog, bool isTwoLevelHashTable>
+void FasterKv<K, V, D, isHotColdLog, isTwoLevelHashTable>::AddHashEntry(HashBucket*& bucket, uint32_t& next_idx, uint8_t version,
                                      HashBucketEntry entry) {
   if(next_idx == HashBucket::kNumEntries) {
     // Need to allocate a new bucket, first.
@@ -2488,8 +2696,8 @@ void FasterKv<K, V, D, isHotColdLog>::AddHashEntry(HashBucket*& bucket, uint32_t
   ++next_idx;
 }
 
-template <class K, class V, class D, bool isHotColdLog>
-Address FasterKv<K, V, D, isHotColdLog>::TraceBackForOtherChainStart(uint64_t old_size, uint64_t new_size,
+template <class K, class V, class D, bool isHotColdLog, bool isTwoLevelHashTable>
+Address FasterKv<K, V, D, isHotColdLog, isTwoLevelHashTable>::TraceBackForOtherChainStart(uint64_t old_size, uint64_t new_size,
     Address from_address, Address min_address, uint8_t side) {
   assert(side == 0 || side == 1);
   // Search back as far as min_address.
@@ -2505,8 +2713,8 @@ Address FasterKv<K, V, D, isHotColdLog>::TraceBackForOtherChainStart(uint64_t ol
   return from_address;
 }
 
-template <class K, class V, class D, bool isHotColdLog>
-void FasterKv<K, V, D, isHotColdLog>::SplitHashTableBuckets() {
+template <class K, class V, class D, bool isHotColdLog, bool isTwoLevelHashTable>
+void FasterKv<K, V, D, isHotColdLog, isTwoLevelHashTable>::SplitHashTableBuckets() {
   // This thread won't exit until all hash table buckets have been split.
   Address head_address = hlog.head_address.load();
   Address begin_address = hlog.begin_address.load();
@@ -2606,8 +2814,8 @@ void FasterKv<K, V, D, isHotColdLog>::SplitHashTableBuckets() {
   }
 }
 
-template <class K, class V, class D, bool isHotColdLog>
-bool FasterKv<K, V, D, isHotColdLog>::GlobalMoveToNextState(SystemState current_state) {
+template <class K, class V, class D, bool isHotColdLog, bool isTwoLevelHashTable>
+bool FasterKv<K, V, D, isHotColdLog, isTwoLevelHashTable>::GlobalMoveToNextState(SystemState current_state) {
   SystemState next_state = current_state.GetNextState();
   if(!system_state_.compare_exchange_strong(current_state, next_state)) {
     return false;
@@ -2782,8 +2990,8 @@ bool FasterKv<K, V, D, isHotColdLog>::GlobalMoveToNextState(SystemState current_
   return true;
 }
 
-template <class K, class V, class D, bool isHotColdLog>
-void FasterKv<K, V, D, isHotColdLog>::MarkAllPendingRequests() {
+template <class K, class V, class D, bool isHotColdLog, bool isTwoLevelHashTable>
+void FasterKv<K, V, D, isHotColdLog, isTwoLevelHashTable>::MarkAllPendingRequests() {
   uint32_t table_version = resize_info_.version;
   uint64_t table_size = state_[table_version].size();
 
@@ -2802,8 +3010,8 @@ void FasterKv<K, V, D, isHotColdLog>::MarkAllPendingRequests() {
   }
 }
 
-template <class K, class V, class D, bool isHotColdLog>
-void FasterKv<K, V, D, isHotColdLog>::HandleSpecialPhases() {
+template <class K, class V, class D, bool isHotColdLog, bool isTwoLevelHashTable>
+void FasterKv<K, V, D, isHotColdLog, isTwoLevelHashTable>::HandleSpecialPhases() {
   SystemState final_state = system_state_.load();
   if(final_state.phase == Phase::REST) {
     // Nothing to do; just reset thread context.
@@ -3012,8 +3220,8 @@ void FasterKv<K, V, D, isHotColdLog>::HandleSpecialPhases() {
   } while(previous_state != final_state);
 }
 
-template <class K, class V, class D, bool isHotColdLog>
-bool FasterKv<K, V, D, isHotColdLog>::Checkpoint(void(*index_persistence_callback)(Status result),
+template <class K, class V, class D, bool isHotColdLog, bool isTwoLevelHashTable>
+bool FasterKv<K, V, D, isHotColdLog, isTwoLevelHashTable>::Checkpoint(void(*index_persistence_callback)(Status result),
                                    void(*hybrid_log_persistence_callback)(Status result,
                                        uint64_t persistent_serial_num), Guid& token) {
   // Only one thread can initiate a checkpoint at a time.
@@ -3049,8 +3257,8 @@ bool FasterKv<K, V, D, isHotColdLog>::Checkpoint(void(*index_persistence_callbac
   return true;
 }
 
-template <class K, class V, class D, bool isHotColdLog>
-bool FasterKv<K, V, D, isHotColdLog>::CheckpointIndex(void(*index_persistence_callback)(Status result),
+template <class K, class V, class D, bool isHotColdLog, bool isTwoLevelHashTable>
+bool FasterKv<K, V, D, isHotColdLog, isTwoLevelHashTable>::CheckpointIndex(void(*index_persistence_callback)(Status result),
                                         Guid& token) {
   // Only one thread can initiate a checkpoint at a time.
   SystemState expected{ Action::None, Phase::REST, system_state_.load().version };
@@ -3073,8 +3281,8 @@ bool FasterKv<K, V, D, isHotColdLog>::CheckpointIndex(void(*index_persistence_ca
   return true;
 }
 
-template <class K, class V, class D, bool isHotColdLog>
-bool FasterKv<K, V, D, isHotColdLog>::CheckpointHybridLog(void(*hybrid_log_persistence_callback)(Status result,
+template <class K, class V, class D, bool isHotColdLog, bool isTwoLevelHashTable>
+bool FasterKv<K, V, D, isHotColdLog, isTwoLevelHashTable>::CheckpointHybridLog(void(*hybrid_log_persistence_callback)(Status result,
     uint64_t persistent_serial_num), Guid& token) {
   // Only one thread can initiate a checkpoint at a time.
   SystemState expected{ Action::None, Phase::REST, system_state_.load().version };
@@ -3102,8 +3310,8 @@ bool FasterKv<K, V, D, isHotColdLog>::CheckpointHybridLog(void(*hybrid_log_persi
   return true;
 }
 
-template <class K, class V, class D, bool isHotColdLog>
-Status FasterKv<K, V, D, isHotColdLog>::Recover(const Guid& index_token, const Guid& hybrid_log_token,
+template <class K, class V, class D, bool isHotColdLog, bool isTwoLevelHashTable>
+Status FasterKv<K, V, D, isHotColdLog, isTwoLevelHashTable>::Recover(const Guid& index_token, const Guid& hybrid_log_token,
                                   uint32_t& version,
                                   std::vector<Guid>& session_ids) {
   version = 0;
@@ -3157,8 +3365,8 @@ Status FasterKv<K, V, D, isHotColdLog>::Recover(const Guid& index_token, const G
 #undef BREAK_NOT_OK
 }
 
-template <class K, class V, class D, bool isHotColdLog>
-bool FasterKv<K, V, D, isHotColdLog>::ShiftBeginAddress(Address address,
+template <class K, class V, class D, bool isHotColdLog, bool isTwoLevelHashTable>
+bool FasterKv<K, V, D, isHotColdLog, isTwoLevelHashTable>::ShiftBeginAddress(Address address,
     GcState::truncate_callback_t truncate_callback,
     GcState::complete_callback_t complete_callback) {
   SystemState expected = SystemState{ Action::None, Phase::REST, system_state_.load().version };
@@ -3178,8 +3386,8 @@ bool FasterKv<K, V, D, isHotColdLog>::ShiftBeginAddress(Address address,
   return true;
 }
 
-template <class K, class V, class D, bool isHotColdLog>
-bool FasterKv<K, V, D, isHotColdLog>::GrowIndex(GrowState::callback_t caller_callback) {
+template <class K, class V, class D, bool isHotColdLog, bool isTwoLevelHashTable>
+bool FasterKv<K, V, D, isHotColdLog, isTwoLevelHashTable>::GrowIndex(GrowState::callback_t caller_callback) {
   SystemState expected = SystemState{ Action::None, Phase::REST, system_state_.load().version };
   if(!system_state_.compare_exchange_strong(expected,
       SystemState{ Action::GrowIndex, Phase::REST, expected.version })) {
@@ -3220,8 +3428,8 @@ inline std::ostream& operator << (std::ostream& out, const FixedPageAddress addr
 
 /// When invoked, compacts the hybrid-log between the begin address and a
 /// passed in offset (`untilAddress`).
-template <class K, class V, class D, bool isHotColdLog>
-bool FasterKv<K, V, D, isHotColdLog>::Compact(uint64_t untilAddress)
+template <class K, class V, class D, bool isHotColdLog, bool isTwoLevelHashTable>
+bool FasterKv<K, V, D, isHotColdLog, isTwoLevelHashTable>::Compact(uint64_t untilAddress)
 {
   // First, initialize a mini FASTER that will store all live records in
   // the range [beginAddress, untilAddress).
@@ -3369,8 +3577,8 @@ private:
   uint8_t* curPtr_;
 };
 
-template <class K, class V, class D, bool isHotColdLog>
-void FasterKv<K, V, D, isHotColdLog>::BatchInsertIntoColdLog(std::pair<Record<K,V>*, bool>* list, int num)
+template <class K, class V, class D, bool isHotColdLog, bool isTwoLevelHashTable>
+void FasterKv<K, V, D, isHotColdLog, isTwoLevelHashTable>::BatchInsertIntoColdLog(std::pair<Record<K,V>*, bool>* list, int num)
 {
   CompletePending(true);
   for (int i = 0; i < num; i++) {
@@ -3400,8 +3608,8 @@ void FasterKv<K, V, D, isHotColdLog>::BatchInsertIntoColdLog(std::pair<Record<K,
   cold_faster_->CompletePending(true);
 }
 
-template <class K, class V, class D, bool isHotColdLog>
-void FasterKv<K, V, D, isHotColdLog>::CompactHotLog(GcState::complete_callback_t complete_callback)
+template <class K, class V, class D, bool isHotColdLog, bool isTwoLevelHashTable>
+void FasterKv<K, V, D, isHotColdLog, isTwoLevelHashTable>::CompactHotLog(GcState::complete_callback_t complete_callback)
 {
   assert(isHotColdLog);
   Address begin = hlog.begin_address.load();
@@ -3481,8 +3689,8 @@ void FasterKv<K, V, D, isHotColdLog>::CompactHotLog(GcState::complete_callback_t
 /// in the safe-read-only region of the main FASTER instance.
 ///
 /// Returns the address upto which the scan was performed.
-template <class K, class V, class D, bool isHotColdLog>
-Address FasterKv<K, V, D, isHotColdLog>::LogScanForValidity(Address from, faster_t* temp)
+template <class K, class V, class D, bool isHotColdLog, bool isTwoLevelHashTable>
+Address FasterKv<K, V, D, isHotColdLog, isTwoLevelHashTable>::LogScanForValidity(Address from, faster_t* temp)
 {
   // Scan upto the safe read only region of the log, deleting all encountered
   // records from the temporary instance of FASTER. Since the safe-read-only
@@ -3522,8 +3730,8 @@ Address FasterKv<K, V, D, isHotColdLog>::LogScanForValidity(Address from, faster
 
 /// Checks if a key exists between a passed in address (`offset`) and the
 /// current tail of the hybrid log.
-template <class K, class V, class D, bool isHotColdLog>
-bool FasterKv<K, V, D, isHotColdLog>::ContainsKeyInMemory(const key_t& key, Address offset)
+template <class K, class V, class D, bool isHotColdLog, bool isTwoLevelHashTable>
+bool FasterKv<K, V, D, isHotColdLog, isTwoLevelHashTable>::ContainsKeyInMemory(const key_t& key, Address offset)
 {
   // First, retrieve the hash table entry corresponding to this key.
   KeyHash hash = key.GetHash();

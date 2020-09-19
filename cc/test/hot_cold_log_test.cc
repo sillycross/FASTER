@@ -409,11 +409,12 @@ TEST(HotColdLog, InMemoryTest) {
   store.StopSession();
 }
 
-TEST(HotColdLog, OnDiskTest)
+template<bool useTwoLevelHashTable>
+void TestHotColdLogOnDisk()
 {
   using handler_t = FASTER::environment::QueueIoHandler;
   using disk_t = FASTER::device::FileSystemDisk<handler_t, 1073741824ull>;
-  using store_t = FASTER::core::FasterKv<Key, Value, disk_t, true>;
+  using store_t = FASTER::core::FasterKv<Key, Value, disk_t, true, useTwoLevelHashTable>;
 
   store_t store { 16777216, 192 * 1048576ULL, "storage", 0.4 /*mutableFraction*/ };
 
@@ -764,11 +765,22 @@ TEST(HotColdLog, OnDiskTest)
   store.StopSession();
 }
 
-TEST(HotColdLog, CompactionTest)
+TEST(HotColdLog, OnDiskTest)
+{
+    TestHotColdLogOnDisk<false /*useTwoLevelht*/>();
+}
+
+TEST(TwoLevelHashTable, OnDiskTest)
+{
+    TestHotColdLogOnDisk<true /*useTwoLevelht*/>();
+}
+
+template<bool useTwoLevelHashTable>
+void TestHotColdLogCompaction()
 {
   using handler_t = FASTER::environment::QueueIoHandler;
   using disk_t = FASTER::device::FileSystemDisk<handler_t, 1073741824ull>;
-  using store_t = FASTER::core::FasterKv<Key, Value, disk_t, true>;
+  using store_t = FASTER::core::FasterKv<Key, Value, disk_t, true, useTwoLevelHashTable>;
 
   store_t store { 1048576, 192 * 1048576ULL, "storage", 0.4 /*mutableFraction*/ };
 
@@ -1133,6 +1145,16 @@ TEST(HotColdLog, CompactionTest)
   assert(cb_call_cnt == pending_cnt);
 
   store.StopSession();
+}
+
+TEST(HotColdLog, CompactionTest)
+{
+    TestHotColdLogCompaction<false /*onDiskHashTable*/>();
+}
+
+TEST(TwoLevelHashTable, CompactionTest)
+{
+    TestHotColdLogCompaction<true /*onDiskHashTable*/>();
 }
 
 int main(int argc, char** argv) {

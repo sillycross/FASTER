@@ -197,5 +197,20 @@ struct alignas(Constants::kCacheLineBytes) HashBucket {
 static_assert(sizeof(HashBucket) == Constants::kCacheLineBytes,
               "sizeof(HashBucket) != Constants::kCacheLineBytes");
 
+struct alignas(Constants::kCacheLineBytes) DiskHashBucket {
+
+  inline static constexpr uint32_t size() {
+    return static_cast<uint32_t>(sizeof(DiskHashBucket));
+  }
+
+  /// Number of entries per bucket (excluding overflow entry).
+  static constexpr uint32_t kNumEntries = 512;
+  /// The entries.
+  AtomicHashBucketEntry entries[kNumEntries];
+  // TODO: support overflow_entry
+};
+static_assert(sizeof(DiskHashBucket) == 4096,
+              "sizeof(DiskHashBucket) != 4096");
+
 }
 } // namespace FASTER::core

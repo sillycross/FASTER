@@ -46,7 +46,8 @@ enum class OperationStatus : uint8_t {
   NOT_FOUND_UNMARK,
   NOT_FOUND_UNMARK_HOTLOG_TOMBSTONE,
   CPR_SHIFT_DETECTED,
-  COLD_LOG_QUERY_ISSUED
+  COLD_LOG_QUERY_ISSUED,
+  TWO_LEVEL_HT_QUERY_ISSUED
 };
 
 /// Internal FASTER context.
@@ -278,22 +279,50 @@ class WrappedAsyncPendingReadContext : public IAsyncContext {
   }
   /// The deep copy constructor.
   WrappedAsyncPendingReadContext(WrappedAsyncPendingReadContext& other)
-    : ctxt_(other.ctxt_), shallow_key_(other.shallow_key_) {
+    : WrappedAsyncPendingReadContext(other.ctxt_) {
+  }
+  WrappedAsyncPendingReadContext(WrappedAsyncPendingReadContext& other, IAsyncContext* caller_context)
+    : WrappedAsyncPendingReadContext(static_cast<AsyncPendingReadContext<K>*>(caller_context)) {
   }
 protected:
     /// The explicit interface requires a DeepCopy_Internal() implementation.
     Status DeepCopy_Internal(IAsyncContext*& context_copy) {
-      return IAsyncContext::DeepCopy_Internal(*this, context_copy);
+      return IAsyncContext::DeepCopy_Internal(*this, ctxt_, context_copy);
     }
  public:
+
+  static void wrapped_caller_callback(IAsyncContext* ctxtTmp, Status status)
+  {
+    WrappedAsyncPendingReadContext<K, V>* ctxt = static_cast<WrappedAsyncPendingReadContext<K, V>*>(ctxtTmp);
+    ctxt->ctxt_->caller_callback(ctxt->ctxt_->caller_context, status);
+  }
+
   const shallow_key_t& key() const { return shallow_key_; }
   void Get(const value_t& value) { return ctxt_->GetV(&value); }
   void GetAtomic(const value_t& value) { return ctxt_->GetAtomicV(&value); }
 
- private:
   // TODO: figure out when this should be freed
   AsyncPendingReadContext<K>* ctxt_;
   shallow_key_t shallow_key_;
+};
+
+struct FasterUInt64Key
+{
+    inline uint32_t size() const {
+      return static_cast<uint32_t>(sizeof(FasterUInt64Key));
+    }
+    inline KeyHash GetHash() const {
+      return KeyHash(Utility::GetHashCode(key));
+    }
+
+    /// Comparison operators.
+    inline bool operator==(const FasterUInt64Key& other) const {
+      return key == other.key;
+    }
+    inline bool operator!=(const FasterUInt64Key& other) const {
+      return !(*this == other);
+    }
+    uint64_t key;
 };
 
 template <class K>
@@ -377,6 +406,8 @@ class AsyncPendingUpsertContext : public PendingContext<K> {
  public:
   virtual void Put(void* rec) = 0;
   virtual bool PutAtomic(void* rec) = 0;
+  virtual void PutV(void* value) = 0;
+  virtual bool PutAtomicV(void* value) = 0;
   virtual uint32_t value_size() const = 0;
 };
 
@@ -436,9 +467,147 @@ class PendingUpsertContext : public AsyncPendingUpsertContext<typename UC::key_t
     record_t* record = reinterpret_cast<record_t*>(rec);
     return upsert_context().PutAtomic(record->value());
   }
-  inline constexpr uint32_t value_size() const final {
+  inline void PutV(void* value) final {
+    value_t* v = reinterpret_cast<value_t*>(value);
+    upsert_context().Put(*v);
+  }
+  inline bool PutAtomicV(void* value) final {
+    value_t* v = reinterpret_cast<value_t*>(value);
+    return upsert_context().PutAtomic(*v);
+  }
+  inline uint32_t value_size() const final {
     return upsert_context().value_size();
   }
+};
+
+/// A wrapper of AsyncPendingReadContext, that allows it to be passed to Read again
+template <class K, class V>
+class WrappedAsyncPendingUpsertContext : public IAsyncContext {
+ public:
+  typedef K key_t;
+  typedef V value_t;
+  using shallow_key_t = WrappedAsyncPendingContextShallowKey<K>;
+
+  WrappedAsyncPendingUpsertContext(AsyncPendingUpsertContext<K>* ctxt)
+    : ctxt_(ctxt)
+    , shallow_key_(ctxt) {
+  }
+  /// The deep copy constructor.
+  WrappedAsyncPendingUpsertContext(WrappedAsyncPendingUpsertContext& other)
+    : ctxt_(other.ctxt_), shallow_key_(other.shallow_key_) {
+  }
+protected:
+    /// The explicit interface requires a DeepCopy_Internal() implementation.
+    Status DeepCopy_Internal(IAsyncContext*& context_copy) {
+      IAsyncContext* tmp;
+      ctxt_->DeepCopy(tmp);
+      AsyncPendingUpsertContext<K>* ctxt_copy = static_cast<AsyncPendingUpsertContext<K>*>(tmp);
+      WrappedAsyncPendingUpsertContext<K, V> copy(ctxt_copy);
+      return IAsyncContext::DeepCopy_Internal(copy, context_copy);
+    }
+ public:
+
+    static void wrapped_caller_callback(IAsyncContext* ctxtTmp, Status status)
+    {
+      WrappedAsyncPendingUpsertContext<K, V>* ctxt = static_cast<WrappedAsyncPendingUpsertContext<K, V>*>(ctxtTmp);
+      ctxt->ctxt_->caller_callback(ctxt->ctxt_->caller_context, status);
+    }
+
+  const shallow_key_t& key() const { return shallow_key_; }
+  void Put(value_t& value) { return ctxt_->PutV(&value); }
+  bool PutAtomic(value_t& value) { return ctxt_->PutAtomicV(&value); }
+  inline uint32_t value_size() const { return ctxt_->value_size(); }
+
+  // TODO: figure out when this should be freed
+  AsyncPendingUpsertContext<K>* ctxt_;
+  shallow_key_t shallow_key_;
+};
+
+template<class K, class V, class T>
+class WrappedRmwContextForTwoLevelHt : public IAsyncContext {
+public:
+    typedef FasterUInt64Key key_t;
+    typedef DiskHashBucket value_t;
+
+    WrappedRmwContextForTwoLevelHt(uint64_t htSize, uint64_t hashValue,
+                                   T* ctxt,
+                                   std::function<void(T*, Status)> retry,
+                                   HashBucketEntry* expectedHashBucketEntry,
+                                   AtomicHashBucketEntry** atomicHashBucketEntry)
+        : ht_size_(htSize), hashValue_(hashValue), ctxt_(ctxt), retry_(retry),
+          expectedHashBucketEntry_(expectedHashBucketEntry), atomicHashBucketEntry_(atomicHashBucketEntry)
+    { }
+
+protected:
+    /// The explicit interface requires a DeepCopy_Internal() implementation.
+    Status DeepCopy_Internal(IAsyncContext*& context_copy) {
+      IAsyncContext* tmp;
+      ctxt_->DeepCopy(tmp);
+      T* ctxt_copy = static_cast<T*>(tmp);
+      WrappedRmwContextForTwoLevelHt<K, V, T> copy(ht_size_, hashValue_, ctxt_copy, retry_, nullptr, nullptr);
+      return IAsyncContext::DeepCopy_Internal(copy, context_copy);
+    }
+
+public:
+
+  FasterUInt64Key key() const {
+      uint64_t v = KeyHash { hashValue_}.idx(ht_size_);
+      return FasterUInt64Key { v };
+  }
+
+  inline static constexpr uint32_t value_size() {
+    return value_t::size();
+  }
+
+  inline static constexpr uint32_t value_size(const value_t& old_value) {
+    return value_t::size();
+  }
+
+  inline void RmwInitial(value_t& value) {
+    for (uint32_t i = 0; i < value.kNumEntries; i++)
+    {
+        value.entries[i].store(HashBucketEntry::kInvalidEntry);
+    }
+    if (from_deep_copy()) {
+        return;
+    }
+    store_output(value);
+  }
+
+  inline void RmwCopy(const value_t& old_value, value_t& value) {
+    for (uint32_t i = 0; i < old_value.kNumEntries; i++)
+    {
+        value.entries[i].store(old_value.entries[i].load());
+    }
+    if (from_deep_copy()) {
+        return;
+    }
+    store_output(value);
+  }
+
+  inline bool RmwAtomic(value_t& value) {
+    if (from_deep_copy()) {
+      return true;
+    }
+    store_output(value);
+    return true;
+  }
+
+  void store_output(value_t& value)
+  {
+      KeyHash kh { hashValue_ };
+      uint32_t slot = static_cast<uint32_t>(kh.tag()) & (DiskHashBucket::kNumEntries - 1);
+      *expectedHashBucketEntry_ = value.entries[slot].load();
+      *atomicHashBucketEntry_ = &value.entries[slot];
+  }
+
+public:
+  uint64_t ht_size_;
+  uint64_t hashValue_;
+  T* ctxt_;
+  std::function<void(T*, Status)> retry_;
+  HashBucketEntry* expectedHashBucketEntry_;
+  AtomicHashBucketEntry** atomicHashBucketEntry_;
 };
 
 /// FASTER's internal Rmw() context.
@@ -693,12 +862,22 @@ class WrappedAsyncPendingDeleteContext : public IAsyncContext {
   WrappedAsyncPendingDeleteContext(WrappedAsyncPendingDeleteContext& other)
     : ctxt_(other.ctxt_), shallow_key_(other.shallow_key_) {
   }
+  WrappedAsyncPendingDeleteContext(WrappedAsyncPendingDeleteContext& other, IAsyncContext* caller_context)
+    : WrappedAsyncPendingDeleteContext(static_cast<AsyncPendingDeleteContext<K>*>(caller_context)) {
+  }
+
  protected:
   /// The explicit interface requires a DeepCopy_Internal() implementation.
   Status DeepCopy_Internal(IAsyncContext*& context_copy) {
-    return IAsyncContext::DeepCopy_Internal(*this, context_copy);
+    return IAsyncContext::DeepCopy_Internal(*this, ctxt_, context_copy);
   }
  public:
+  static void wrapped_caller_callback(IAsyncContext* ctxtTmp, Status status)
+  {
+    WrappedAsyncPendingDeleteContext<K, V>* ctxt = static_cast<WrappedAsyncPendingDeleteContext<K, V>*>(ctxtTmp);
+    ctxt->ctxt_->caller_callback(ctxt->ctxt_->caller_context, status);
+  }
+
   const shallow_key_t& key() const { return shallow_key_; }
   uint32_t value_size() const { return ctxt_->value_size(); }
 
